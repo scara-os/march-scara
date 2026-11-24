@@ -1,0 +1,8 @@
+[package]
+name = "scara-shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk = { version = "0.11", package = "gtk4", features = ["v4_8"] }
+gtk-layer-shell = { version = "0.8.1", package = "gtk4-layer-shell" }

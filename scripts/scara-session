@@ -1,0 +1,21 @@
+#!/bin/sh
+# MARCH SCARA Official Session Startup
+
+export XDG_CURRENT_DESKTOP=MARCH-SCARA
+export XDG_SESSION_DESKTOP=MARCH-SCARA
+export XDG_SESSION_TYPE=wayland
+export MOZ_ENABLE_WAYLAND=1
+export QT_QPA_PLATFORM="wayland;xcb"
+export GDK_BACKEND="wayland,x11"
+export GSK_RENDERER=gl
+
+# Sinkronkan variabel environment ke D-Bus & systemd user
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
+fi
+
+# Jalankan PipeWire audio
+systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null
+
+# Jalankan MARCH SCARA Compositor
+exec /usr/bin/scara-wm "$@"

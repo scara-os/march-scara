@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scara-wm",
+    "crates/scara-ctl",
+    "crates/scara-shell",
+    "crates/scara-daemon",
+]

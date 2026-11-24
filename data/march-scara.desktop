@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=MARCH SCARA
+Comment=macOS Tahoe Visuals, Hyprland Freedom, GNOME Comfort
+Exec=/usr/bin/scara-session
+Type=Application
+DesktopNames=MARCH-SCARA
+Keywords=wayland;compositor;desktop;scara;
