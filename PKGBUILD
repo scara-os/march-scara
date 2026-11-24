@@ -2,7 +2,7 @@
 pkgname=march-scara-git
 _pkgname=march-scara
 pkgver=0.1.0.r3.g8ae363c
-pkgrel=1
+pkgrel=2
 pkgdesc="macOS Tahoe-styled Desktop Environment with Hyprland freedom and GNOME comfort"
 arch=('x86_64')
 url="https://github.com/scara-os/march-scara"
@@ -18,6 +18,15 @@ depends=(
   'mesa'
   'pipewire'
   'lua54'
+  'kitty'
+  'nautilus'
+  'loupe'
+  'pipewire-audio'
+  'pipewire-pulse'
+  'wireplumber'
+  'pamixer'
+  'xdg-desktop-portal'
+  'xdg-desktop-portal-gtk'
 )
 
 makedepends=(
@@ -31,13 +40,14 @@ makedepends=(
 optdepends=(
   'mactahoe-icon-theme-git: native macOS Tahoe icon theme'
   'mactahoe-gtk-theme: macOS Tahoe dark theme'
-  'kitty: default terminal'
-  'nautilus: default file manager'
   'gnome-text-editor: default text editor'
   'gnome-control-center: system settings GUI'
-  'pamixer: sound volume slider control'
+  'pavucontrol: graphical audio mixer'
+  'evince: PDF/document viewer'
+  'file-roller: archive manager'
   'networkmanager: native Wi-Fi integration'
-  'bluez: native Bluetooth integration'
+  'bluez: Bluetooth service'
+  'bluez-utils: Bluetooth control tools'
   'grim: screenshot tool'
   'slurp: region selector for screenshots'
   'wl-clipboard: Wayland clipboard manager'
