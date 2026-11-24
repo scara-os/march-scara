@@ -69,6 +69,7 @@ impl Smallvil {
         display: Display<Self>,
         config: Arc<Mutex<ScaraConfig>>,
         config_path: String,
+        seat_name: &str,
     ) -> Self {
         let start_time = std::time::Instant::now();
         let dh = display.handle();
@@ -82,7 +83,7 @@ impl Smallvil {
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let popups = PopupManager::default();
 
-        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         seat.add_pointer();
 

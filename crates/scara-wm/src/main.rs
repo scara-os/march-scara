@@ -1,5 +1,6 @@
 #![allow(irrefutable_let_patterns)]
 
+mod drm;
 mod glass_renderer;
 mod grabs;
 mod handlers;
@@ -13,16 +14,18 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
+use smithay::backend::session::{libseat::LibSeatSession, Session};
 use smithay::reexports::{
     calloop::{channel, EventLoop},
     wayland_server::{Display, DisplayHandle},
 };
 pub use state::Smallvil;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct CalloopData {
     state: Smallvil,
     display_handle: DisplayHandle,
+    drm_backend: Option<drm::DrmBackend>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,6 +41,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = format!("{}/.config/march-scara/init.lua", home);
     let config = lua_bridge::load_user_config(&config_path)?;
     info!("Loaded Lua config: {:?}", config.lock().unwrap());
+
+    let backend = std::env::var("SCARA_BACKEND").unwrap_or_else(|_| "winit".into());
+    let (seat_name, session) = match backend.as_str() {
+        "winit" => ("winit".to_string(), None),
+        "drm" => {
+            let (session, notifier) = LibSeatSession::new()?;
+            let seat_name = session.seat();
+            (seat_name, Some((session, notifier)))
+        }
+        other => {
+            return Err(format!("Unsupported SCARA_BACKEND value: {other}").into());
+        }
+    };
 
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
     let (ipc_tx, ipc_rx) = channel::channel::<String>();
@@ -88,14 +104,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let display: Display<Smallvil> = Display::new()?;
     let display_handle = display.handle();
-    let state = Smallvil::new(&mut event_loop, display, Arc::clone(&config), config_path);
+    let state = Smallvil::new(
+        &mut event_loop,
+        display,
+        Arc::clone(&config),
+        config_path,
+        &seat_name,
+    );
 
     let mut data = CalloopData {
         state,
         display_handle,
+        drm_backend: None,
     };
 
-    crate::winit::init_winit(&mut event_loop, &mut data)?;
+    match session {
+        Some((session, notifier)) => {
+            drm::DrmBackend::initialize(&mut event_loop, &mut data, session, notifier)?;
+        }
+        None => {
+            crate::winit::init_winit(&mut event_loop, &mut data)?;
+        }
+    }
+
+    std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
+    update_dbus_activation_environment();
 
     // Jalankan komponen DE (scara-daemon, scara-shell dengan GSK_RENDERER=gl, dan kitty)
     let exe_dir = std::env::current_exe()
@@ -150,4 +183,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = std::fs::remove_file(&sock_path);
     std::process::exit(0);
+}
+
+fn update_dbus_activation_environment() {
+    match std::process::Command::new("dbus-update-activation-environment")
+        .args([
+            "--systemd",
+            "WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_DESKTOP",
+            "XDG_SESSION_TYPE",
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!("Failed to update D-Bus activation environment: {status}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            warn!("dbus-update-activation-environment is unavailable");
+        }
+        Err(error) => warn!("Failed to update D-Bus activation environment: {error}"),
+    }
 }

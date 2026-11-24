@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState},
@@ -237,7 +237,49 @@ impl Smallvil {
                     self.execute_action(&action);
                 }
             }
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { event, .. } => {
+                let Some(pointer) = self.seat.get_pointer() else {
+                    return;
+                };
+                let mut bounds: Option<(f64, f64, f64, f64)> = None;
+                for output in self.space.outputs() {
+                    let Some(geometry) = self.space.output_geometry(output) else {
+                        continue;
+                    };
+                    let left = f64::from(geometry.loc.x);
+                    let top = f64::from(geometry.loc.y);
+                    let right = left + f64::from(geometry.size.w);
+                    let bottom = top + f64::from(geometry.size.h);
+                    bounds = Some(match bounds {
+                        Some((min_x, min_y, max_x, max_y)) => (
+                            min_x.min(left),
+                            min_y.min(top),
+                            max_x.max(right),
+                            max_y.max(bottom),
+                        ),
+                        None => (left, top, right, bottom),
+                    });
+                }
+                let Some((left, top, right, bottom)) = bounds else {
+                    return;
+                };
+                let mut location = pointer.current_location() + event.delta();
+                location.x = location.x.clamp(left, right - 1.0);
+                location.y = location.y.clamp(top, bottom - 1.0);
+
+                let serial = SERIAL_COUNTER.next_serial();
+                let under = self.surface_under(location);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
                 let output_geo = self.space.output_geometry(output).unwrap();

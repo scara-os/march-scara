@@ -4,15 +4,11 @@
 export XDG_CURRENT_DESKTOP=MARCH-SCARA
 export XDG_SESSION_DESKTOP=MARCH-SCARA
 export XDG_SESSION_TYPE=wayland
+export SCARA_BACKEND=drm
 export MOZ_ENABLE_WAYLAND=1
 export QT_QPA_PLATFORM="wayland;xcb"
 export GDK_BACKEND="wayland,x11"
 export GSK_RENDERER=gl
-
-# Sinkronkan environment Wayland ke D-Bus & systemd user
-if command -v dbus-update-activation-environment >/dev/null 2>&1; then
-    dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
-fi
 
 # Nyalakan audio PipeWire
 systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null

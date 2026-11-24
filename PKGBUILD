@@ -1,7 +1,7 @@
 # Maintainer: Scara <scara@archlinux>
 pkgname=march-scara-git
 _pkgname=march-scara
-pkgver=0.1.0.r1.ga3085d5
+pkgver=0.1.0.r3.g8ae363c
 pkgrel=1
 pkgdesc="macOS Tahoe-styled Desktop Environment with Hyprland freedom and GNOME comfort"
 arch=('x86_64')
@@ -49,25 +49,23 @@ source=("git+https://github.com/scara-os/march-scara.git")
 sha256sums=('SKIP')
 
 pkgver() {
-  cd "$_pkgname"
-  git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' ||
-  printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
-}
-
-prepare() {
-  cd "$_pkgname"
-  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  cd "$srcdir/$_pkgname"
+  if git describe --tags >/dev/null 2>&1; then
+    git describe --long --tags | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    printf "0.1.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  fi
 }
 
 build() {
-  cd "$_pkgname"
+  cd "$srcdir/$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
-  cargo build --frozen --release --workspace
+  cargo build --release --workspace
 }
 
 package() {
-  cd "$_pkgname"
+  cd "$srcdir/$_pkgname"
 
   # 1. Pasang Binary Inti ke /usr/bin/
   install -Dm755 "target/release/scara-wm" "$pkgdir/usr/bin/scara-wm"
