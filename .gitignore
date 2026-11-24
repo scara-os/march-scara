@@ -1,4 +1,23 @@
+# Rust build output
 /target/
-*.pkg.tar.zst
+**/target/
+**/*.rs.bk
+
+# makepkg output
 /pkg/
 /src/
+*.pkg.tar*
+
+# Local nested checkout
+/march-scara/
+
+# Local-only files
+.env
+.env.*
+!.env.example
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
