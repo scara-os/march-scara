@@ -9,12 +9,12 @@ export QT_QPA_PLATFORM="wayland;xcb"
 export GDK_BACKEND="wayland,x11"
 export GSK_RENDERER=gl
 
-# Sinkronkan variabel environment ke D-Bus & systemd user
+# Sinkronkan environment Wayland ke D-Bus & systemd user
 if command -v dbus-update-activation-environment >/dev/null 2>&1; then
     dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE
 fi
 
-# Jalankan PipeWire audio
+# Nyalakan audio PipeWire
 systemctl --user start pipewire pipewire-pulse wireplumber 2>/dev/null
 
 # Jalankan MARCH SCARA Compositor
