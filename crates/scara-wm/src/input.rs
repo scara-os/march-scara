@@ -13,7 +13,7 @@ use smithay::{
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
@@ -306,9 +306,30 @@ impl Smallvil {
                 let button = event.button_code();
                 let button_state = event.state();
                 let super_held = keyboard.modifier_state().logo;
+                let pos = pointer.current_location();
+                let under = self.surface_under(pos);
+                pointer.motion(
+                    self,
+                    under,
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+
+                info!(
+                    button,
+                    ?button_state,
+                    focused = pointer.current_focus().is_some(),
+                    "Pointer button event"
+                );
+                if button_state == ButtonState::Pressed && pointer.current_focus().is_none() {
+                    warn!(button, "Pointer button pressed without a focused surface");
+                }
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    let pos = pointer.current_location();
                     if let Some((window, loc)) = self
                         .space
                         .element_under(pos)
