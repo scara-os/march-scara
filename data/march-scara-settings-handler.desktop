@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=MARCH SCARA Settings Link Handler
+Comment=Open a MARCH SCARA Settings panel from a deep link
+Exec=/usr/bin/scara-shell %u
+Type=Application
+NoDisplay=true
+Terminal=false
+StartupNotify=false
+MimeType=x-scheme-handler/mactahoe;

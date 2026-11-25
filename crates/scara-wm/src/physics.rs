@@ -9,7 +9,13 @@ pub struct Spring {
 
 impl Spring {
     pub fn new(initial: f32, stiffness: f32, damping: f32) -> Self {
-        Self { value: initial, target: initial, velocity: 0.0, stiffness, damping }
+        Self {
+            value: initial,
+            target: initial,
+            velocity: 0.0,
+            stiffness,
+            damping,
+        }
     }
 
     /// Update fisika per frame (dt dalam detik, misal 1.0 / 120.0)

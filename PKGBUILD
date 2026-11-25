@@ -1,7 +1,7 @@
 # Maintainer: Scara <scara@archlinux>
 pkgname=march-scara-git
 _pkgname=march-scara
-pkgver=0.1.0.r11.g7a2f46b
+pkgver=0.1.0.r12.g653e742
 pkgrel=1
 pkgdesc="macOS Tahoe-styled Desktop Environment with Hyprland freedom and GNOME comfort"
 arch=('x86_64')
@@ -17,14 +17,36 @@ depends=(
   'seatd'
   'mesa'
   'pipewire'
-  'lua54'
-  'kitty'
-  'nautilus'
-  'loupe'
   'pipewire-audio'
   'pipewire-pulse'
   'wireplumber'
+  'lua54'
+  'kitty'
+  'thunar'
+  'gvfs'
+  'firefox'
+  'mpv'
+  'loupe'
+  'gnome-calendar'
+  'gnome-calculator'
+  'gnome-control-center'
+  'gnome-text-editor'
+  'evince'
+  'file-roller'
+  'mako'
+  'swappy'
+  'grim'
+  'slurp'
+  'wl-clipboard'
   'pamixer'
+  'pavucontrol'
+  'networkmanager'
+  'nm-connection-editor'
+  'bluez'
+  'bluez-utils'
+  'blueman'
+  'polkit'
+  'polkit-gnome'
   'xdg-desktop-portal'
   'xdg-desktop-portal-gtk'
 )
@@ -40,17 +62,8 @@ makedepends=(
 optdepends=(
   'mactahoe-icon-theme-git: native macOS Tahoe icon theme'
   'mactahoe-gtk-theme: macOS Tahoe dark theme'
-  'gnome-text-editor: default text editor'
-  'gnome-control-center: system settings GUI'
-  'pavucontrol: graphical audio mixer'
-  'evince: PDF/document viewer'
-  'file-roller: archive manager'
-  'networkmanager: native Wi-Fi integration'
-  'bluez: Bluetooth service'
-  'bluez-utils: Bluetooth control tools'
-  'grim: screenshot tool'
-  'slurp: region selector for screenshots'
-  'wl-clipboard: Wayland clipboard manager'
+  'thunar-archive-plugin: archive integration in Thunar'
+  'gvfs-mtp: MTP device support in Thunar'
 )
 
 provides=('march-scara')
@@ -86,6 +99,7 @@ package() {
 
   # 2. Pasang Desktop Entry untuk Login Manager (GDM/SDDM)
   install -Dm644 "data/march-scara.desktop" "$pkgdir/usr/share/wayland-sessions/march-scara.desktop"
+  install -Dm644 "data/march-scara-settings-handler.desktop" "$pkgdir/usr/share/applications/march-scara-settings-handler.desktop"
 
   # 3. Pasang Konfigurasi XDG Desktop Portal
   install -Dm644 "data/march-scara-portals.conf" "$pkgdir/usr/share/xdg-desktop-portal/march-scara-portals.conf"
@@ -93,4 +107,7 @@ package() {
   # 4. Pasang Default Template Config (untuk sistem dan user baru)
   install -Dm644 "data/init.lua" "$pkgdir/usr/share/march-scara/init.lua"
   install -Dm644 "data/init.lua" "$pkgdir/etc/skel/.config/march-scara/init.lua"
+
+  # 5. Dokumentasi aktivasi layanan sistem secara opsional
+  install -Dm644 "POST-INSTALL.md" "$pkgdir/usr/share/doc/march-scara/POST-INSTALL.md"
 }

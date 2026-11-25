@@ -1,19 +1,26 @@
 use gtk::prelude::*;
 use gtk::{
     glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, ContentFit, CssProvider,
-    Grid, IconTheme, Image, Label, MenuButton, Orientation, Picture, Popover, Scale,
-    ScrolledWindow, SearchEntry, Separator, Stack, StackSidebar, Switch,
+    DropDown, Entry, FileChooserAction, FileChooserNative, Grid, IconTheme, Image, Label,
+    MenuButton, Orientation, Picture, Popover, ProgressBar, ResponseType, Scale, ScrolledWindow,
+    SearchEntry, Separator, Stack, Switch,
 };
 use gtk_layer_shell::{Edge, Layer, LayerShell};
 use std::{
+    cell::{Cell, RefCell},
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::Command,
+    rc::Rc,
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
 };
+
+mod preferences;
+
+use preferences::{AccentColor, GlassStyle, MenuBarModules, ThemeMode, UserPreferences};
 
 const TAHOE_CSS: &str = r#"
 window,
@@ -34,8 +41,157 @@ window.apps-launcher {
 }
 
 .settings-sidebar {
-    background-color: rgba(255, 255, 255, 0.06);
+    background-color: rgba(255, 255, 255, 0.07);
+    border-right: 1px solid rgba(255, 255, 255, 0.12);
+    padding: 16px 12px;
 }
+
+.settings-toolbar {
+    background-color: rgba(255, 255, 255, 0.035);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.10);
+    padding: 10px 18px;
+}
+
+.settings-profile-card {
+    background-color: rgba(255, 255, 255, 0.09);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    padding: 10px;
+    margin: 10px 0 14px;
+}
+
+.settings-avatar {
+    background-color: #0a84ff;
+    border-radius: 99px;
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+.settings-section-title {
+    color: rgba(245, 245, 247, 0.56);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 12px 8px 4px;
+}
+
+button.settings-nav-button {
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    box-shadow: none;
+    color: rgba(245, 245, 247, 0.88);
+    min-height: 32px;
+    padding: 4px 9px;
+    text-align: left;
+}
+
+button.settings-nav-button:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+}
+
+button.settings-nav-button.selected {
+    background-color: #0a84ff;
+    color: #ffffff;
+}
+
+.settings-page-title {
+    font-size: 25px;
+    font-weight: 700;
+}
+
+.settings-help-button {
+    border-radius: 99px;
+    min-width: 30px;
+    min-height: 30px;
+}
+
+.settings-integration-note {
+    color: rgba(245, 245, 247, 0.64);
+    font-size: 11px;
+    padding-top: 2px;
+}
+
+window.settings-window.light-theme {
+    background-color: #f2f3f7;
+    color: #1c1c1e;
+}
+
+window.settings-window.light-theme .settings-sidebar {
+    background-color: rgba(20, 28, 45, 0.045);
+    border-right-color: rgba(20, 28, 45, 0.12);
+}
+
+window.settings-window.light-theme .settings-toolbar {
+    background-color: rgba(255, 255, 255, 0.65);
+    border-bottom-color: rgba(20, 28, 45, 0.10);
+}
+
+window.settings-window.light-theme .settings-profile-card,
+window.settings-window.light-theme .cc-card {
+    background-color: rgba(255, 255, 255, 0.76);
+    border-color: rgba(20, 28, 45, 0.10);
+}
+
+window.settings-window.light-theme .cc-title {
+    color: #1c1c1e;
+}
+
+window.settings-window.light-theme .cc-sub,
+window.settings-window.light-theme .settings-section-title,
+window.settings-window.light-theme .settings-integration-note {
+    color: rgba(28, 28, 30, 0.66);
+}
+
+window.settings-window.light-theme button.settings-nav-button {
+    color: rgba(28, 28, 30, 0.88);
+}
+
+window.settings-window.light-theme button.settings-nav-button.selected {
+    color: #ffffff;
+}
+
+window.settings-window.glass-clear .cc-card,
+window.settings-window.glass-clear .settings-profile-card {
+    background-color: rgba(255, 255, 255, 0.035);
+}
+
+window.settings-window.glass-tinted .cc-card,
+window.settings-window.glass-tinted .settings-profile-card {
+    background-color: rgba(91, 126, 201, 0.19);
+}
+
+window.settings-window.light-theme.glass-clear .cc-card,
+window.settings-window.light-theme.glass-clear .settings-profile-card {
+    background-color: rgba(255, 255, 255, 0.40);
+}
+
+window.settings-window.light-theme.glass-tinted .cc-card,
+window.settings-window.light-theme.glass-tinted .settings-profile-card {
+    background-color: rgba(110, 142, 205, 0.16);
+}
+
+window.settings-window.reduce-transparency .cc-card,
+window.settings-window.reduce-transparency .settings-profile-card,
+window.settings-window.reduce-transparency .settings-toolbar,
+window.settings-window.reduce-transparency .settings-sidebar {
+    background-color: #30313a;
+}
+
+window.settings-window.light-theme.reduce-transparency .cc-card,
+window.settings-window.light-theme.reduce-transparency .settings-profile-card,
+window.settings-window.light-theme.reduce-transparency .settings-toolbar,
+window.settings-window.light-theme.reduce-transparency .settings-sidebar {
+    background-color: #e5e7ee;
+}
+
+window.settings-window.accent-purple button.settings-nav-button.selected { background-color: #8e63e6; }
+window.settings-window.accent-pink button.settings-nav-button.selected { background-color: #e34f9b; }
+window.settings-window.accent-red button.settings-nav-button.selected { background-color: #e5484d; }
+window.settings-window.accent-orange button.settings-nav-button.selected { background-color: #e87928; }
+window.settings-window.accent-yellow button.settings-nav-button.selected { background-color: #bd9200; }
+window.settings-window.accent-green button.settings-nav-button.selected { background-color: #30a46c; }
+window.settings-window.accent-graphite button.settings-nav-button.selected { background-color: #64666d; }
 
 .tahoe-wallpaper-fallback {
     background-image:
@@ -297,6 +453,375 @@ fn run_cmd_output(cmd: &str) -> String {
         .unwrap_or_default()
 }
 
+fn run_program_output(program: &str, args: &[&str]) -> Result<String, String> {
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    run_system_command_output(program, &args)
+}
+
+fn run_system_command_output(program: &str, args: &[String]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("command exited with {}", output.status)
+        } else {
+            detail
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_system_command_async<F>(
+    program: &'static str,
+    args: Vec<String>,
+    status: Label,
+    on_complete: F,
+) where
+    F: FnOnce(bool) + 'static,
+{
+    status.set_text("Applying system change...");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(run_system_command_output(program, &args));
+    });
+
+    let mut on_complete = Some(on_complete);
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(result) => {
+                let succeeded = result.is_ok();
+                match result {
+                    Ok(_) => status.set_text("System change completed."),
+                    Err(error) => status.set_text(&format!("System change failed: {error}")),
+                }
+                if let Some(on_complete) = on_complete.take() {
+                    on_complete(succeeded);
+                }
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_text("System operation ended without a result.");
+                if let Some(on_complete) = on_complete.take() {
+                    on_complete(false);
+                }
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn split_nmcli_terse_row(row: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut escaped = false;
+
+    for character in row.chars() {
+        if escaped {
+            field.push(character);
+            escaped = false;
+        } else {
+            match character {
+                '\\' => escaped = true,
+                ':' => fields.push(std::mem::take(&mut field)),
+                _ => field.push(character),
+            }
+        }
+    }
+    if escaped {
+        field.push('\\');
+    }
+    fields.push(field);
+    fields
+}
+
+#[derive(Debug, PartialEq)]
+struct WifiNetwork {
+    ssid: String,
+    signal: u8,
+    security: String,
+    in_use: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct WifiProfile {
+    name: String,
+    uuid: String,
+    active: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct BluetoothDevice {
+    address: String,
+    name: String,
+    paired: bool,
+    connected: bool,
+}
+
+fn parse_bluetooth_powered(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("Powered: ")?;
+        match value {
+            "yes" => Some(true),
+            "no" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn parse_bluetooth_device_rows(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line
+                .trim()
+                .strip_prefix("[NEW] ")
+                .or_else(|| line.trim().strip_prefix("[CHG] "))
+                .unwrap_or_else(|| line.trim());
+            let mut fields = line.split_whitespace();
+            if fields.next()? != "Device" {
+                return None;
+            }
+            let address = fields.next()?.to_string();
+            if !valid_bluetooth_address(&address) {
+                return None;
+            }
+            let name = fields.collect::<Vec<_>>().join(" ");
+            Some((address, name))
+        })
+        .collect()
+}
+
+fn valid_bluetooth_address(address: &str) -> bool {
+    address.len() == 17
+        && address
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index % 3 {
+                2 => byte == b':',
+                _ => byte.is_ascii_hexdigit(),
+            })
+}
+
+fn parse_bluetooth_devices(paired: &str, found: &str, connected: &str) -> Vec<BluetoothDevice> {
+    let paired_rows = parse_bluetooth_device_rows(paired);
+    let found_rows = parse_bluetooth_device_rows(found);
+    let connected_addresses = parse_bluetooth_device_rows(connected)
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect::<std::collections::HashSet<_>>();
+    let paired_addresses = paired_rows
+        .iter()
+        .map(|(address, _)| address.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut devices: Vec<BluetoothDevice> = Vec::new();
+    for (address, name) in paired_rows.into_iter().chain(found_rows) {
+        if let Some(existing) = devices.iter_mut().find(|device| device.address == address) {
+            if existing.name.is_empty() && !name.is_empty() {
+                existing.name = name;
+            }
+            continue;
+        }
+        devices.push(BluetoothDevice {
+            paired: paired_addresses.contains(&address),
+            connected: connected_addresses.contains(&address),
+            address,
+            name,
+        });
+    }
+    devices
+}
+
+fn refresh_bluetooth_devices(list: &GtkBox, status: &Label) {
+    let paired = match run_program_output("bluetoothctl", &["devices", "Paired"]) {
+        Ok(output) => output,
+        Err(error) => {
+            status.set_text(&format!("Could not list paired devices: {error}"));
+            return;
+        }
+    };
+    let found = match run_program_output("bluetoothctl", &["devices"]) {
+        Ok(output) => output,
+        Err(error) => {
+            status.set_text(&format!("Could not list nearby devices: {error}"));
+            return;
+        }
+    };
+    let connected = match run_program_output("bluetoothctl", &["devices", "Connected"]) {
+        Ok(output) => output,
+        Err(error) => {
+            status.set_text(&format!("Could not read connected devices: {error}"));
+            return;
+        }
+    };
+
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    let devices = parse_bluetooth_devices(&paired, &found, &connected);
+    if devices.is_empty() {
+        status.set_text("No Bluetooth devices found. Start a scan to discover nearby devices.");
+        return;
+    }
+    status.set_text(&format!("{} Bluetooth device(s) found.", devices.len()));
+
+    for device in devices {
+        let row = GtkBox::new(Orientation::Vertical, 4);
+        let title = if device.name.is_empty() {
+            device.address.clone()
+        } else {
+            device.name.clone()
+        };
+        let name = Label::new(Some(&title));
+        name.set_halign(Align::Start);
+        name.add_css_class("cc-title");
+        let state = match (device.paired, device.connected) {
+            (true, true) => "Paired · Connected",
+            (true, false) => "Paired · Not connected",
+            (false, _) => "Not paired",
+        };
+        let detail = Label::new(Some(&format!("{} · {}", device.address, state)));
+        detail.set_halign(Align::Start);
+        detail.add_css_class("cc-sub");
+        row.append(&name);
+        row.append(&detail);
+
+        let actions = GtkBox::new(Orientation::Horizontal, 6);
+        let status_ref = status.clone();
+        let list_ref = list.clone();
+        if device.paired {
+            let action = if device.connected {
+                "Disconnect"
+            } else {
+                "Connect"
+            };
+            let action_button = Button::with_label(action);
+            action_button.add_css_class("flat");
+            action_button.add_css_class("menu-action-btn");
+            let command = if device.connected {
+                "disconnect"
+            } else {
+                "connect"
+            };
+            let address = device.address.clone();
+            let action_status = status_ref.clone();
+            let action_list = list_ref.clone();
+            action_button.connect_clicked(move |_| {
+                let status_after = action_status.clone();
+                let list_after = action_list.clone();
+                run_system_command_async(
+                    "bluetoothctl",
+                    vec![command.to_string(), address.clone()],
+                    action_status.clone(),
+                    move |success| {
+                        if success {
+                            refresh_bluetooth_devices(&list_after, &status_after);
+                        }
+                    },
+                );
+            });
+            actions.append(&action_button);
+
+            let forget_button = Button::with_label("Forget");
+            forget_button.add_css_class("flat");
+            forget_button.add_css_class("menu-action-btn");
+            let address = device.address;
+            forget_button.connect_clicked(move |_| {
+                let status_after = status_ref.clone();
+                let list_after = list_ref.clone();
+                run_system_command_async(
+                    "bluetoothctl",
+                    vec!["remove".to_string(), address.clone()],
+                    status_ref.clone(),
+                    move |success| {
+                        if success {
+                            refresh_bluetooth_devices(&list_after, &status_after);
+                        }
+                    },
+                );
+            });
+            actions.append(&forget_button);
+        } else {
+            let pair_button = Button::with_label("Pair in Blueman");
+            pair_button.add_css_class("flat");
+            pair_button.add_css_class("menu-action-btn");
+            pair_button.connect_clicked(move |_| match launch_program("blueman-manager", &[]) {
+                Ok(()) => status_ref
+                    .set_text("Opened Blueman to confirm pairing and device authorization."),
+                Err(error) => {
+                    status_ref.set_text(&format!("Bluetooth manager unavailable: {error}"))
+                }
+            });
+            actions.append(&pair_button);
+        }
+        row.append(&actions);
+        list.append(&row);
+    }
+}
+
+fn parse_wifi_profiles(output: &str) -> Vec<WifiProfile> {
+    output
+        .lines()
+        .filter_map(|row| {
+            let fields = split_nmcli_terse_row(row);
+            if fields.len() != 4
+                || !matches!(fields[2].as_str(), "802-11-wireless" | "wifi")
+                || fields[0].is_empty()
+                || fields[1].is_empty()
+            {
+                return None;
+            }
+            Some(WifiProfile {
+                name: fields[0].clone(),
+                uuid: fields[1].clone(),
+                active: !fields[3].is_empty() && fields[3] != "--",
+            })
+        })
+        .collect()
+}
+
+fn parse_wifi_networks(output: &str) -> Vec<WifiNetwork> {
+    let mut networks: Vec<WifiNetwork> = Vec::new();
+    for row in output.lines() {
+        let fields = split_nmcli_terse_row(row);
+        if fields.len() != 4 || fields[1].trim().is_empty() {
+            continue;
+        }
+
+        let network = WifiNetwork {
+            in_use: fields[0].trim() == "*",
+            ssid: fields[1].trim().to_string(),
+            signal: fields[2].trim().parse::<u8>().unwrap_or(0).min(100),
+            security: match fields[3].trim() {
+                "" | "--" => "Open".to_string(),
+                security => security.to_string(),
+            },
+        };
+        if let Some(existing) = networks
+            .iter_mut()
+            .find(|existing| existing.ssid == network.ssid)
+        {
+            if (network.in_use && !existing.in_use)
+                || (network.in_use == existing.in_use && network.signal > existing.signal)
+            {
+                *existing = network;
+            }
+        } else {
+            networks.push(network);
+        }
+    }
+    networks
+}
+
 fn load_desktop_apps() -> Vec<DesktopApp> {
     let mut apps = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -369,7 +894,40 @@ fn load_desktop_apps() -> Vec<DesktopApp> {
     apps
 }
 
+fn activate_launcher_entry(
+    exec: &str,
+    settings_window: &ApplicationWindow,
+    settings_navigator: &SettingsNavigator,
+) {
+    if exec == "__scara_settings__" {
+        settings_window.present();
+    } else if let Some(panel) = exec.strip_prefix("__scara_settings__:") {
+        settings_navigator(panel);
+    } else {
+        launch_app(exec);
+    }
+}
+
+fn launcher_entry_matches(query: &str, app: &DesktopApp) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    if app.exec.starts_with("__scara_settings__:") {
+        settings_search_matches(&query, &format!("{} {}", app.name, app.exec))
+    } else {
+        app.name.to_lowercase().contains(&query) || app.exec.to_lowercase().contains(&query)
+    }
+}
+
 fn find_wallpaper_path() -> Option<PathBuf> {
+    if let Ok(preferences) = preferences::load() {
+        if let Some(path) = preferences.wallpaper.filter(|path| path.is_file()) {
+            return Some(path);
+        }
+    }
+
     let home = std::env::var("HOME").ok()?;
     let candidates = [
         format!("{}/.config/march-scara/wallpaper.jpg", home),
@@ -380,6 +938,119 @@ fn find_wallpaper_path() -> Option<PathBuf> {
         .into_iter()
         .map(PathBuf::from)
         .find(|p| p.exists())
+}
+
+fn update_preferences(
+    current: &Rc<RefCell<UserPreferences>>,
+    update: impl FnOnce(&mut UserPreferences),
+) -> std::io::Result<()> {
+    let mut updated = current.borrow().clone();
+    update(&mut updated);
+    preferences::save(&updated)?;
+    *current.borrow_mut() = updated;
+    Ok(())
+}
+
+type MenuBarWidgetRegistry = Rc<RefCell<std::collections::HashMap<String, gtk::Widget>>>;
+type SettingsNavigator = Rc<dyn Fn(&str)>;
+
+fn update_menu_bar_module(preferences: &mut UserPreferences, name: &str, visible: bool) {
+    match name {
+        "bluetooth" => preferences.menu_bar.bluetooth = visible,
+        "battery" => preferences.menu_bar.battery = visible,
+        "wifi" => preferences.menu_bar.wifi = visible,
+        "spotlight" => preferences.menu_bar.spotlight = visible,
+        "control_center" => preferences.menu_bar.control_center = visible,
+        "clock" => preferences.menu_bar.clock = visible,
+        "sound" => preferences.menu_bar.sound = visible,
+        _ => {}
+    }
+}
+
+fn menu_bar_module_visible(modules: &MenuBarModules, name: &str) -> bool {
+    match name {
+        "bluetooth" => modules.bluetooth,
+        "battery" => modules.battery,
+        "wifi" => modules.wifi,
+        "spotlight" => modules.spotlight,
+        "control_center" => modules.control_center,
+        "clock" => modules.clock,
+        "sound" => modules.sound,
+        _ => false,
+    }
+}
+
+fn set_menu_bar_module_visibility(widgets: &MenuBarWidgetRegistry, preferences: &UserPreferences) {
+    let modules: &MenuBarModules = &preferences.menu_bar;
+    for (name, visible) in [
+        ("bluetooth", modules.bluetooth),
+        ("battery", modules.battery),
+        ("wifi", modules.wifi),
+        ("spotlight", modules.spotlight),
+        ("control_center", modules.control_center),
+        ("clock", modules.clock),
+        ("sound", modules.sound),
+    ] {
+        if let Some(widget) = widgets.borrow().get(name) {
+            widget.set_visible(visible);
+        }
+    }
+}
+
+fn update_clock_widget(widgets: &MenuBarWidgetRegistry, preferences: &UserPreferences) {
+    if let Some(widget) = widgets.borrow().get("clock") {
+        if let Ok(label) = widget.clone().downcast::<Label>() {
+            label.set_text(&format_tahoe_clock(preferences.clock_24_hour));
+        }
+    }
+}
+
+fn apply_appearance(window: &ApplicationWindow, preferences: &UserPreferences) {
+    for class in [
+        "light-theme",
+        "glass-clear",
+        "glass-tinted",
+        "reduce-transparency",
+        "accent-blue",
+        "accent-purple",
+        "accent-pink",
+        "accent-red",
+        "accent-orange",
+        "accent-yellow",
+        "accent-green",
+        "accent-graphite",
+    ] {
+        window.remove_css_class(class);
+    }
+
+    match preferences.theme {
+        ThemeMode::Auto => {}
+        ThemeMode::Light => window.add_css_class("light-theme"),
+        ThemeMode::Dark => {}
+    }
+    match preferences.glass {
+        GlassStyle::Standard => {}
+        GlassStyle::Clear => window.add_css_class("glass-clear"),
+        GlassStyle::Tinted => window.add_css_class("glass-tinted"),
+    }
+    if preferences.reduce_transparency {
+        window.add_css_class("reduce-transparency");
+    }
+    let accent_class = match preferences.accent {
+        AccentColor::Blue => "accent-blue",
+        AccentColor::Purple => "accent-purple",
+        AccentColor::Pink => "accent-pink",
+        AccentColor::Red => "accent-red",
+        AccentColor::Orange => "accent-orange",
+        AccentColor::Yellow => "accent-yellow",
+        AccentColor::Green => "accent-green",
+        AccentColor::Graphite => "accent-graphite",
+    };
+    window.add_css_class(accent_class);
+
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(preferences.theme == ThemeMode::Dark);
+    }
 }
 
 fn apply_tahoe_icon_theme() {
@@ -397,30 +1068,174 @@ fn apply_tahoe_icon_theme() {
     }
 }
 
-fn format_tahoe_clock() -> String {
+fn format_tahoe_clock(use_24_hour: bool) -> String {
     glib::DateTime::now_local()
         .ok()
-        .and_then(|dt| dt.format("%a %b %-d  %-I:%M %p").ok())
+        .and_then(|dt| dt.format(clock_format_string(use_24_hour)).ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "MARCH SCARA".to_string())
 }
 
+fn clock_format_string(use_24_hour: bool) -> &'static str {
+    if use_24_hour {
+        "%a %b %-d  %H:%M"
+    } else {
+        "%a %b %-d  %-I:%M %p"
+    }
+}
+
+fn battery_paths() -> Vec<PathBuf> {
+    let mut batteries = std::fs::read_dir("/sys/class/power_supply")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let kind = std::fs::read_to_string(path.join("type")).ok()?;
+            (kind.trim() == "Battery").then_some(path)
+        })
+        .collect::<Vec<_>>();
+    if batteries.is_empty() {
+        batteries.extend(
+            ["BAT0", "BAT1"].map(|name| PathBuf::from("/sys/class/power_supply").join(name)),
+        );
+    }
+    batteries
+}
+
 fn read_battery_info() -> (String, String) {
-    for bat in ["BAT0", "BAT1"] {
-        let cap_path = format!("/sys/class/power_supply/{}/capacity", bat);
-        let stat_path = format!("/sys/class/power_supply/{}/status", bat);
+    for battery in battery_paths() {
+        let cap_path = battery.join("capacity");
+        let stat_path = battery.join("status");
         if let Ok(cap) = std::fs::read_to_string(cap_path) {
             let status = std::fs::read_to_string(stat_path)
-                .unwrap_or_else(|_| "Unknown".into())
+                .unwrap_or_else(|_| "Status unavailable".into())
                 .trim()
                 .to_string();
             return (format!("{}%", cap.trim()), status);
         }
     }
-    ("100%".to_string(), "AC Power".to_string())
+    (
+        "No battery detected".to_string(),
+        "Not available".to_string(),
+    )
 }
 
-fn build_wallpaper(app: &Application) {
+fn read_battery_health() -> (Option<String>, Option<String>) {
+    for battery in battery_paths() {
+        let energy_pair = ("energy_full", "energy_full_design");
+        let charge_pair = ("charge_full", "charge_full_design");
+        let capacity = [energy_pair, charge_pair]
+            .into_iter()
+            .find_map(|(full, design)| {
+                let full = std::fs::read_to_string(battery.join(full))
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                let design = std::fs::read_to_string(battery.join(design))
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()?;
+                battery_health_percentage(full, design)
+                    .map(|percentage| format!("{percentage:.0}%"))
+            });
+        let cycles = std::fs::read_to_string(battery.join("cycle_count"))
+            .ok()
+            .map(|value| format!("{} cycles", value.trim()));
+        if capacity.is_some() || cycles.is_some() {
+            return (capacity, cycles);
+        }
+    }
+    (None, None)
+}
+
+fn battery_health_percentage(full: u64, design: u64) -> Option<f64> {
+    (design > 0).then(|| (full as f64 / design as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+fn os_display_name() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("PRETTY_NAME=")
+                    .map(|value| value.trim_matches('"').to_string())
+            })
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Linux (version unavailable)".to_string())
+}
+
+fn cpu_display_name() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("model name\t: ")
+                    .or_else(|| line.strip_prefix("Hardware\t: "))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "Not reported by the system".to_string())
+}
+
+fn memory_display_size() -> String {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                let value = line.strip_prefix("MemTotal:")?.split_whitespace().next()?;
+                value.parse::<u64>().ok()
+            })
+        })
+        .map(|kib| format!("{:.1} GiB", kib as f64 / 1_048_576.0))
+        .unwrap_or_else(|| "Not reported by the system".to_string())
+}
+
+fn parse_storage_row(row: &str) -> Result<(String, f64), String> {
+    let columns: Vec<&str> = row.split_whitespace().collect();
+    if columns.len() < 6 {
+        return Err("Filesystem usage data was incomplete".to_string());
+    }
+    let used_percentage = columns[4]
+        .strip_suffix('%')
+        .ok_or_else(|| "Filesystem usage did not include a percentage".to_string())?
+        .parse::<f64>()
+        .map_err(|error| format!("Invalid filesystem usage percentage: {error}"))?;
+
+    Ok((
+        format!(
+            "{} total · {} used · {} available · {} used",
+            columns[1], columns[2], columns[3], columns[4]
+        ),
+        (used_percentage / 100.0).clamp(0.0, 1.0),
+    ))
+}
+
+fn root_storage_display() -> Result<(String, f64), String> {
+    let output = Command::new("df")
+        .args(["-hP", "--", "/"])
+        .output()
+        .map_err(|error| format!("Could not run df: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("df exited with {}", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let row = stdout
+        .lines()
+        .skip(1)
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "No filesystem usage data was returned".to_string())?;
+    parse_storage_row(row)
+}
+
+fn build_wallpaper(app: &Application) -> Picture {
     let bg_win = ApplicationWindow::builder()
         .application(app)
         .title("scara-wallpaper")
@@ -435,25 +1250,29 @@ fn build_wallpaper(app: &Application) {
     bg_win.set_anchor(Edge::Left, true);
     bg_win.set_anchor(Edge::Right, true);
 
+    let background = GtkBox::new(Orientation::Vertical, 0);
+    background.add_css_class("tahoe-wallpaper-fallback");
+    let picture = Picture::new();
+    picture.set_content_fit(ContentFit::Cover);
+    picture.set_can_shrink(true);
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
     if let Some(path) = find_wallpaper_path() {
-        let pic = Picture::for_filename(&path);
-        pic.set_content_fit(ContentFit::Cover);
-        pic.set_can_shrink(true);
-        bg_win.set_child(Some(&pic));
-    } else {
-        let fallback = GtkBox::new(Orientation::Vertical, 0);
-        fallback.add_css_class("tahoe-wallpaper-fallback");
-        fallback.set_hexpand(true);
-        fallback.set_vexpand(true);
-        bg_win.set_child(Some(&fallback));
+        if let Some(filename) = path.to_str() {
+            picture.set_filename(Some(filename));
+        }
     }
+    background.append(&picture);
+    bg_win.set_child(Some(&background));
 
     bg_win.present();
+    picture
 }
 
 fn build_app_launcher(
     app: &Application,
     settings_window: &ApplicationWindow,
+    settings_navigator: &SettingsNavigator,
 ) -> (ApplicationWindow, SearchEntry) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -493,6 +1312,24 @@ fn build_app_launcher(
         exec: "__scara_settings__".into(),
         icon: "preferences-system-symbolic".into(),
     });
+    for (name, panel) in [
+        ("Wi-Fi Settings", "wifi"),
+        ("Bluetooth Settings", "bluetooth"),
+        ("Network Settings", "network"),
+        ("Night Shift / Layar Kuning", "display"),
+        ("Battery Settings", "battery"),
+        ("Appearance Settings", "appearance"),
+        ("Wallpaper Settings", "wallpaper"),
+        ("Privacy & Security", "privacy"),
+        ("Keyboard Settings", "keyboard"),
+        ("Accessibility Settings", "accessibility"),
+    ] {
+        apps.push(DesktopApp {
+            name: name.into(),
+            exec: format!("__scara_settings__:{panel}"),
+            icon: "preferences-system-symbolic".into(),
+        });
+    }
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
     let populate = {
@@ -500,19 +1337,15 @@ fn build_app_launcher(
         let apps = apps.clone();
         let window = window.clone();
         let settings_window = settings_window.clone();
+        let settings_navigator = settings_navigator.clone();
         move |query: &str| {
             while let Some(child) = grid.first_child() {
                 grid.remove(&child);
             }
 
-            let query = query.trim().to_lowercase();
             let mut column = 0;
             let mut row = 0;
-            for app in apps.iter().filter(|app| {
-                query.is_empty()
-                    || app.name.to_lowercase().contains(&query)
-                    || app.exec.to_lowercase().contains(&query)
-            }) {
+            for app in apps.iter().filter(|app| launcher_entry_matches(query, app)) {
                 let icon = Image::from_icon_name(&app.icon);
                 icon.set_pixel_size(40);
                 let label = Label::new(Some(&app.name));
@@ -533,13 +1366,10 @@ fn build_app_launcher(
                 let exec = app.exec.clone();
                 let window = window.clone();
                 let settings_window = settings_window.clone();
+                let settings_navigator = settings_navigator.clone();
                 button.connect_clicked(move |_| {
                     window.set_visible(false);
-                    if exec == "__scara_settings__" {
-                        settings_window.present();
-                    } else {
-                        launch_app(&exec);
-                    }
+                    activate_launcher_entry(&exec, &settings_window, &settings_navigator);
                 });
                 grid.attach(&button, column, row, 1, 1);
                 column += 1;
@@ -558,19 +1388,19 @@ fn build_app_launcher(
     let apps_for_enter = apps;
     let window_for_enter = window.clone();
     let settings_for_enter = settings_window.clone();
+    let settings_navigator_for_enter = settings_navigator.clone();
     search.connect_activate(move |entry| {
-        let query = entry.text().trim().to_lowercase();
-        if let Some(app) = apps_for_enter.iter().find(|app| {
-            query.is_empty()
-                || app.name.to_lowercase().contains(&query)
-                || app.exec.to_lowercase().contains(&query)
-        }) {
+        let query = entry.text();
+        if let Some(app) = apps_for_enter
+            .iter()
+            .find(|app| launcher_entry_matches(&query, app))
+        {
             window_for_enter.set_visible(false);
-            if app.exec == "__scara_settings__" {
-                settings_for_enter.present();
-            } else {
-                launch_app(&app.exec);
-            }
+            activate_launcher_entry(
+                &app.exec,
+                &settings_for_enter,
+                &settings_navigator_for_enter,
+            );
         }
     });
 
@@ -579,13 +1409,14 @@ fn build_app_launcher(
 
 fn settings_page(title: &str, description: &str) -> GtkBox {
     let page = GtkBox::new(Orientation::Vertical, 14);
-    page.set_margin_top(28);
+    page.set_margin_top(24);
     page.set_margin_bottom(24);
-    page.set_margin_start(28);
-    page.set_margin_end(28);
+    page.set_margin_start(22);
+    page.set_margin_end(22);
 
     let heading = Label::new(Some(title));
     heading.add_css_class("cc-title");
+    heading.add_css_class("settings-page-title");
     heading.set_halign(Align::Start);
     page.append(&heading);
 
@@ -595,6 +1426,104 @@ fn settings_page(title: &str, description: &str) -> GtkBox {
     detail.set_wrap(true);
     page.append(&detail);
     page
+}
+
+fn settings_search_matches(query: &str, searchable_text: &str) -> bool {
+    let normalized_query = query
+        .trim()
+        .to_lowercase()
+        .replace("layar kuning", "night shift")
+        .replace("resolusi", "resolution")
+        .replace("jaringan", "network")
+        .replace("baterai", "battery")
+        .replace("tampilan", "display")
+        .replace("suara", "sound")
+        .replace("sandi", "password");
+    let ignored_words = [
+        "aktifkan", "ubah", "ganti", "matikan", "buka", "atur", "enable", "disable", "turn", "on",
+        "off", "the", "to",
+    ];
+    let query_terms: Vec<&str> = normalized_query
+        .split_whitespace()
+        .filter(|term| !ignored_words.contains(term))
+        .collect();
+    if query_terms.is_empty() {
+        return true;
+    }
+
+    let candidates: Vec<&str> = searchable_text.split_whitespace().collect();
+    query_terms.iter().all(|term| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.contains(term) || one_edit_away(term, candidate))
+    })
+}
+
+fn settings_panel_from_uri(uri: &str) -> Option<&'static str> {
+    let path = uri.strip_prefix("mactahoe://settings/")?;
+    let path = path
+        .split(|character| matches!(character, '?' | '#'))
+        .next()?;
+    let mut segments = path.split('/');
+    let panel = segments.next()?;
+    let subpanel = segments.next();
+
+    match (panel, subpanel) {
+        ("network", Some("wifi" | "wi-fi")) => Some("wifi"),
+        ("display", _) | ("displays", _) => Some("display"),
+        ("appearance", _) => Some("appearance"),
+        ("privacy", _) => Some("privacy"),
+        ("battery", _) | ("power", _) => Some("battery"),
+        ("sound", _) | ("audio", _) => Some("sound"),
+        ("bluetooth", _) => Some("bluetooth"),
+        ("wifi", _) | ("wi-fi", _) => Some("wifi"),
+        ("network", _) => Some("network"),
+        ("wallpaper", _) => Some("wallpaper"),
+        ("general", _) | ("system", _) => Some("general"),
+        ("keyboard", _) => Some("keyboard"),
+        ("trackpad", _) => Some("trackpad"),
+        ("mouse", _) => Some("mouse"),
+        ("accessibility", _) => Some("accessibility"),
+        ("notifications", _) | ("focus", _) => Some("notifications"),
+        ("account", _) | ("profile", _) => Some("account"),
+        ("dock", _) | ("desktop", _) => Some("desktop_dock"),
+        ("control-center", _) | ("menu-bar", _) => Some("control_center"),
+        ("lock-screen", _) => Some("lock_screen"),
+        ("passwords", _) | ("passkeys", _) => Some("passwords"),
+        ("printers", _) => Some("printers"),
+        _ => None,
+    }
+}
+
+fn one_edit_away(left: &str, right: &str) -> bool {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len().abs_diff(right.len()) > 1 {
+        return false;
+    }
+
+    let (mut left_index, mut right_index, mut edits) = (0, 0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        if left[left_index] == right[right_index] {
+            left_index += 1;
+            right_index += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            if left.len() > right.len() {
+                left_index += 1;
+            } else if right.len() > left.len() {
+                right_index += 1;
+            } else {
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    edits + usize::from(left_index < left.len() || right_index < right.len()) <= 1
 }
 
 fn settings_card(title: &str, description: &str) -> GtkBox {
@@ -613,6 +1542,29 @@ fn settings_card(title: &str, description: &str) -> GtkBox {
     card.append(&heading);
     card.append(&detail);
     card
+}
+
+fn settings_control_row(label: &str, control: &impl gtk::prelude::IsA<gtk::Widget>) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    let title = Label::new(Some(label));
+    title.add_css_class("cc-sub");
+    title.set_halign(Align::Start);
+    title.set_hexpand(true);
+    row.append(&title);
+    row.append(control);
+    row
+}
+
+fn add_settings_integration_note(page: &GtkBox, title: &str, detail: &str) {
+    let card = settings_card(title, detail);
+    let note = Label::new(Some(
+        "MARCH SCARA does not manage this setting yet. No system change will be made here.",
+    ));
+    note.add_css_class("settings-integration-note");
+    note.set_halign(Align::Start);
+    note.set_wrap(true);
+    card.append(&note);
+    page.append(&card);
 }
 
 fn add_settings_tool(
@@ -638,14 +1590,40 @@ fn add_settings_tool(
     page.append(&row);
 }
 
-fn build_settings_window(app: &Application) -> ApplicationWindow {
+fn persist_settings_change(
+    preferences: &Rc<RefCell<UserPreferences>>,
+    window: &ApplicationWindow,
+    status: &Label,
+    update: impl FnOnce(&mut UserPreferences),
+) -> bool {
+    match update_preferences(preferences, update) {
+        Ok(()) => {
+            apply_appearance(window, &preferences.borrow());
+            status.set_text("Saved. Changes are applied immediately.");
+            true
+        }
+        Err(error) => {
+            status.set_text(&format!("Could not save settings: {error}"));
+            false
+        }
+    }
+}
+
+fn build_settings_window(
+    app: &Application,
+    wallpaper_picture: &Picture,
+    preferences: Rc<RefCell<UserPreferences>>,
+    preferences_error: Option<String>,
+    menu_bar_widgets: MenuBarWidgetRegistry,
+) -> (ApplicationWindow, SettingsNavigator) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("MARCH SCARA Settings")
-        .default_width(980)
-        .default_height(680)
+        .default_width(780)
+        .default_height(720)
         .build();
     window.add_css_class("settings-window");
+    apply_appearance(&window, &preferences.borrow());
 
     let layout = GtkBox::new(Orientation::Horizontal, 0);
     let stack = Stack::new();
@@ -653,293 +1631,1485 @@ fn build_settings_window(app: &Application) -> ApplicationWindow {
     stack.set_vexpand(true);
     stack.set_transition_type(gtk::StackTransitionType::Crossfade);
 
-    let sidebar = StackSidebar::new();
-    sidebar.set_stack(&stack);
-    sidebar.set_size_request(220, -1);
+    let sidebar = GtkBox::new(Orientation::Vertical, 6);
+    sidebar.set_size_request(230, -1);
     sidebar.add_css_class("settings-sidebar");
-    layout.append(&sidebar);
-    layout.append(&stack);
 
-    let page_specs = [
-        (
-            "wifi",
-            "Wi-Fi",
-            "Manage wireless connections and radio state.",
-        ),
-        (
-            "bluetooth",
-            "Bluetooth",
-            "Manage Bluetooth power and connected devices.",
-        ),
-        (
-            "display",
-            "Displays",
-            "Configure resolution, orientation, and monitor layout.",
-        ),
-        (
-            "appearance",
-            "Appearance",
-            "Adjust desktop colors, icons, and wallpaper.",
-        ),
-        (
-            "network",
-            "Network",
-            "Review network connections and wired settings.",
-        ),
-        (
-            "sound",
-            "Sound",
-            "Control output volume and open the audio mixer.",
-        ),
-        (
-            "power",
-            "Power",
-            "Review battery status and power-management tools.",
-        ),
-        (
-            "multitasking",
-            "Multitasking",
-            "Configure workspaces, tiling, and window behavior.",
-        ),
-        (
-            "apps",
-            "Apps & Defaults",
-            "Browse applications and manage default apps.",
-        ),
-        (
-            "notifications",
-            "Notifications",
-            "Configure notification behavior.",
-        ),
-        (
-            "search",
-            "App Search",
-            "Search and launch installed desktop applications.",
-        ),
-        (
-            "mouse",
-            "Mouse & Touchpad",
-            "Pointer speed, scrolling, and touchpad click behavior.",
-        ),
-        (
-            "keyboard",
-            "Keyboard & Shortcuts",
-            "Review keyboard layout and MARCH SCARA shortcuts.",
-        ),
-        (
-            "accessibility",
-            "Accessibility",
-            "Accessibility options and assistive technologies.",
-        ),
-        (
-            "privacy",
-            "Privacy & Encryption",
-            "Privacy controls, screen lock, and encryption status.",
-        ),
-        ("system", "System", "System information and session tools."),
-    ];
+    let search = SearchEntry::new();
+    search.set_placeholder_text(Some("Search settings"));
+    sidebar.append(&search);
 
-    for (id, title, description) in page_specs {
-        let page = settings_page(title, description);
-        match id {
-            "wifi" => {
-                let card = settings_card("Wireless", "Toggle Wi-Fi using NetworkManager.");
-                let controls = GtkBox::new(Orientation::Horizontal, 10);
-                let status = Label::new(Some(&format!(
-                    "Wi-Fi radio: {}",
-                    run_cmd_output("nmcli radio wifi")
-                )));
-                status.add_css_class("cc-sub");
-                let toggle = Switch::new();
-                toggle.set_active(run_cmd_output("nmcli radio wifi") == "enabled");
-                let status_ref = status.clone();
-                toggle.connect_active_notify(move |switch| {
-                    let action = if switch.is_active() { "on" } else { "off" };
-                    launch_app(&format!("nmcli radio wifi {action}"));
-                    status_ref.set_text(&format!("Wi-Fi radio: {}", action));
-                });
-                controls.append(&status);
-                controls.append(&toggle);
-                card.append(&controls);
-                page.append(&card);
-                add_settings_tool(&page, "Open connection editor", "nm-connection-editor", &[]);
-            }
-            "bluetooth" => {
-                let card =
-                    settings_card("Bluetooth radio", "Power the Bluetooth adapter on or off.");
-                let controls = GtkBox::new(Orientation::Horizontal, 10);
-                let powered =
-                    run_cmd_output("bluetoothctl show | grep 'Powered:' | awk '{print $2}'");
-                let status = Label::new(Some(if powered == "yes" {
-                    "Bluetooth is on"
-                } else {
-                    "Bluetooth is off"
-                }));
-                status.add_css_class("cc-sub");
-                let toggle = Switch::new();
-                toggle.set_active(powered == "yes");
-                let status_ref = status.clone();
-                toggle.connect_active_notify(move |switch| {
-                    let action = if switch.is_active() { "on" } else { "off" };
-                    launch_app(&format!("bluetoothctl power {action}"));
-                    status_ref.set_text(if switch.is_active() {
-                        "Bluetooth is on"
-                    } else {
-                        "Bluetooth is off"
-                    });
-                });
-                controls.append(&status);
-                controls.append(&toggle);
-                card.append(&controls);
-                page.append(&card);
-                add_settings_tool(&page, "Open Bluetooth manager", "blueman-manager", &[]);
-            }
-            "sound" => {
-                let card = settings_card("Output volume", "Adjust the default audio output.");
-                let slider = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-                if let Ok(volume) = run_cmd_output("pamixer --get-volume").parse::<f64>() {
-                    slider.set_value(volume);
-                }
-                slider.connect_value_changed(|scale| {
-                    launch_app(&format!(
-                        "pamixer --set-volume {}",
-                        scale.value().round() as u32
-                    ));
-                });
-                card.append(&slider);
-                page.append(&card);
-                add_settings_tool(&page, "Open audio mixer", "pavucontrol", &[]);
-            }
-            "power" => {
-                let (capacity, state) = read_battery_info();
-                page.append(&settings_card(
-                    "Battery",
-                    &format!("Charge: {capacity} · State: {state}"),
-                ));
-                add_settings_tool(
-                    &page,
-                    "Open power settings",
-                    "gnome-control-center",
-                    &["power"],
-                );
-            }
-            "apps" | "search" => {
-                let card = settings_card(
-                    "Installed applications",
-                    "Use the MARCH SCARA application grid to search and launch desktop apps.",
-                );
-                let button = Button::with_label("Open application grid");
-                button.add_css_class("flat");
-                button.add_css_class("menu-action-btn");
-                let app = app.clone();
-                button.connect_clicked(move |_| {
-                    if let Some(window) = app
-                        .windows()
-                        .into_iter()
-                        .find(|window| window.title().as_deref() == Some("Applications"))
-                    {
-                        window.present();
-                    }
-                });
-                card.append(&button);
-                page.append(&card);
-                add_settings_tool(
-                    &page,
-                    "Default application settings",
-                    "gnome-control-center",
-                    &["applications"],
-                );
-            }
-            "keyboard" => {
-                let card = settings_card(
-                    "MARCH SCARA shortcuts",
-                    "Super+Return: terminal · Super+E: files · Super+Q: close · Super+1–5: workspaces · Super alone: app launcher.",
-                );
-                page.append(&card);
-                add_settings_tool(
-                    &page,
-                    "Open keyboard settings",
-                    "gnome-control-center",
-                    &["keyboard"],
-                );
-            }
-            "mouse" => {
-                page.append(&settings_card(
-                    "Touchpad",
-                    "Tap-to-click is enabled by MARCH SCARA when supported by the device. Pointer settings are applied by libinput.",
-                ));
-                add_settings_tool(
-                    &page,
-                    "Open mouse settings",
-                    "gnome-control-center",
-                    &["mouse"],
-                );
-            }
-            "multitasking" => {
-                page.append(&settings_card(
-                    "Workspaces and windows",
-                    "Use Super+1–5 to switch workspaces, Super+Shift+1–5 to move a window, Super+F to toggle floating, and Super+T to toggle layout.",
-                ));
-            }
-            "display" => add_settings_tool(&page, "Open display controls", "wdisplays", &[]),
-            "appearance" => add_settings_tool(
-                &page,
-                "Open appearance settings",
-                "gnome-control-center",
-                &["appearance"],
-            ),
-            "network" => add_settings_tool(
-                &page,
-                "Open network connections",
-                "nm-connection-editor",
-                &[],
-            ),
-            "notifications" => add_settings_tool(
-                &page,
-                "Open notification settings",
-                "gnome-control-center",
-                &["notifications"],
-            ),
-            "accessibility" => add_settings_tool(
-                &page,
-                "Open accessibility settings",
-                "gnome-control-center",
-                &["universal-access"],
-            ),
-            "privacy" => {
-                page.append(&settings_card(
-                    "Privacy and encryption",
-                    "MARCH SCARA does not yet change encryption, lock-screen, or system privacy policy. Use your system's trusted security tools for these controls.",
-                ));
-                add_settings_tool(
-                    &page,
-                    "Open privacy settings",
-                    "gnome-control-center",
-                    &["privacy"],
-                );
-            }
-            "system" => {
-                page.append(&settings_card(
-                    "MARCH SCARA",
-                    "Standalone Wayland session using DRM/KMS, libinput, and Smithay.",
-                ));
-                add_settings_tool(
-                    &page,
-                    "Open system information",
-                    "gnome-control-center",
-                    &["about"],
-                );
-            }
-            _ => page.append(&settings_card(
-                "Settings integration",
-                "This settings section is not connected to a system control yet.",
-            )),
-        }
-        stack.add_titled(&page, Some(id), title);
+    let profile = GtkBox::new(Orientation::Horizontal, 10);
+    profile.add_css_class("settings-profile-card");
+    let avatar = Image::from_icon_name("avatar-default-symbolic");
+    avatar.set_size_request(40, 40);
+    avatar.set_pixel_size(40);
+    avatar.add_css_class("settings-avatar");
+    let profile_details = GtkBox::new(Orientation::Vertical, 3);
+    let username = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+    let initial_name = preferences
+        .borrow()
+        .display_name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(username);
+    let profile_name = Label::new(Some(&initial_name));
+    profile_name.add_css_class("cc-title");
+    profile_name.set_halign(Align::Start);
+    let profile_id = Label::new(Some("Local account"));
+    profile_id.add_css_class("cc-sub");
+    profile_id.set_halign(Align::Start);
+    profile_details.append(&profile_name);
+    profile_details.append(&profile_id);
+    profile.append(&avatar);
+    profile.append(&profile_details);
+    sidebar.append(&profile);
+    if let Some(path) = preferences
+        .borrow()
+        .avatar
+        .as_ref()
+        .filter(|path| path.is_file())
+        .and_then(|path| path.to_str())
+    {
+        avatar.set_from_file(Some(path));
     }
 
+    let nav_scroll = ScrolledWindow::new();
+    nav_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    nav_scroll.set_vexpand(true);
+    let nav_content = GtkBox::new(Orientation::Vertical, 2);
+    nav_scroll.set_child(Some(&nav_content));
+    let no_results = Label::new(Some("No settings found"));
+    no_results.add_css_class("cc-sub");
+    no_results.set_halign(Align::Start);
+    no_results.set_margin_top(12);
+    no_results.set_margin_start(8);
+    no_results.set_visible(false);
+    nav_content.append(&no_results);
+    sidebar.append(&nav_scroll);
+
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.set_hexpand(true);
+    content.set_vexpand(true);
+
+    let page_title = Label::new(Some("User Profile"));
+    page_title.add_css_class("cc-title");
+    page_title.set_halign(Align::Center);
+    page_title.set_hexpand(true);
+    let toolbar = GtkBox::new(Orientation::Horizontal, 8);
+    toolbar.add_css_class("settings-toolbar");
+    let back = Button::with_label("‹");
+    back.set_tooltip_text(Some("Back"));
+    back.set_sensitive(false);
+    let forward = Button::with_label("›");
+    forward.set_tooltip_text(Some("Forward"));
+    forward.set_sensitive(false);
+    let help = Button::with_label("?");
+    help.add_css_class("settings-help-button");
+    help.set_tooltip_text(Some(
+        "Supported changes apply immediately. Application permissions follow host desktop portals, and administrator authorization is handled by system services such as Polkit.",
+    ));
+    toolbar.append(&back);
+    toolbar.append(&forward);
+    toolbar.append(&page_title);
+    toolbar.append(&help);
+
+    content.append(&toolbar);
+    content.append(&stack);
+
+    let page_groups: [(&str, &[(&str, &str, &str, &str)]); 6] = [
+        (
+            "LOCAL USER",
+            &[(
+                "account",
+                "User Profile",
+                "Manage the local display name and profile photo.",
+                "profile local user display name avatar photo",
+            )],
+        ),
+        (
+            "CONNECTIVITY",
+            &[
+                (
+                    "wifi",
+                    "Wi-Fi",
+                    "Manage wireless connections and radio state.",
+                    "wireless internet network dns known networks wifi wi-fi",
+                ),
+                (
+                    "bluetooth",
+                    "Bluetooth",
+                    "Manage Bluetooth power and connected devices.",
+                    "bluetooth paired headphones discoverable",
+                ),
+                (
+                    "network",
+                    "Network",
+                    "Review network connections, VPN, and wired settings.",
+                    "ethernet vpn proxy firewall network",
+                ),
+            ],
+        ),
+        (
+            "PERSONALIZATION & WORKSPACE",
+            &[
+                (
+                    "appearance",
+                    "Appearance",
+                    "Theme, accent color, and Liquid Glass appearance.",
+                    "light dark theme accent transparency liquid glass tinted",
+                ),
+                (
+                    "display",
+                    "Displays",
+                    "Configure resolution, refresh rate, and monitor layout.",
+                    "screen resolution refresh rate monitor night shift brightness",
+                ),
+                (
+                    "wallpaper",
+                    "Wallpaper & Screen Saver",
+                    "Choose a desktop background and screen saver.",
+                    "wallpaper background aerial screensaver screen saver",
+                ),
+                (
+                    "desktop_dock",
+                    "Desktop & Dock",
+                    "Configure the Dock, window tiling, and hot corners.",
+                    "dock desktop windows stage manager tiling hot corners",
+                ),
+                (
+                    "multitasking",
+                    "Multitasking",
+                    "Configure workspaces, tiling, and window behavior.",
+                    "multitasking workspace floating window layout",
+                ),
+                (
+                    "control_center",
+                    "Control Center & Menu Bar",
+                    "Choose which controls appear in the menu bar.",
+                    "control center menu bar menubar icons modules",
+                ),
+            ],
+        ),
+        (
+            "SYSTEM",
+            &[
+                (
+                    "general",
+                    "General",
+                    "About this system, updates, storage, and startup items.",
+                    "about update software storage login items date language reset",
+                ),
+                (
+                    "sound",
+                    "Sound",
+                    "Control output volume and open the audio mixer.",
+                    "audio sound speaker microphone volume balance",
+                ),
+                (
+                    "notifications",
+                    "Notifications & Focus",
+                    "Mako notifications and notification preferences.",
+                    "notifications focus do not disturb banners alerts",
+                ),
+                (
+                    "battery",
+                    "Battery",
+                    "Review battery status and power-management tools.",
+                    "battery power energy low power charging",
+                ),
+                (
+                    "apps",
+                    "Apps & Defaults",
+                    "Browse applications and manage default apps.",
+                    "apps applications defaults launcher installed software",
+                ),
+                (
+                    "search",
+                    "App Search",
+                    "Search and launch installed desktop applications.",
+                    "search apps launcher spotlight",
+                ),
+            ],
+        ),
+        (
+            "PRIVACY & SECURITY",
+            &[
+                (
+                    "privacy",
+                    "Privacy & Security",
+                    "Review privacy controls and system security.",
+                    "privacy permissions camera microphone filevault firewall security",
+                ),
+                (
+                    "lock_screen",
+                    "Lock Screen",
+                    "Configure screen locking and sleep behavior.",
+                    "lock screen password sleep screen saver",
+                ),
+                (
+                    "passwords",
+                    "Passwords & Passkeys",
+                    "Open the system credential manager.",
+                    "passwords passkeys credentials vault keychain",
+                ),
+            ],
+        ),
+        (
+            "DEVICES & ACCESSIBILITY",
+            &[
+                (
+                    "keyboard",
+                    "Keyboard",
+                    "Review keyboard layout and MARCH SCARA shortcuts.",
+                    "keyboard key repeat input sources shortcuts",
+                ),
+                (
+                    "trackpad",
+                    "Trackpad",
+                    "Configure touchpad gestures and scrolling.",
+                    "trackpad touchpad gestures natural scrolling tap click",
+                ),
+                (
+                    "mouse",
+                    "Mouse",
+                    "Pointer speed, scrolling, and mouse controls.",
+                    "mouse pointer cursor double click",
+                ),
+                (
+                    "printers",
+                    "Printers & Scanners",
+                    "Review connected printers and scanners.",
+                    "printer scanner print queue",
+                ),
+                (
+                    "accessibility",
+                    "Accessibility",
+                    "Assistive features for vision, hearing, and motor access.",
+                    "accessibility voiceover zoom captions voice control contrast",
+                ),
+            ],
+        ),
+    ];
+
+    let active_buttons = Rc::new(RefCell::new(Vec::<Button>::new()));
+    let search_groups = Rc::new(RefCell::new(Vec::<(GtkBox, Vec<(Button, String)>)>::new()));
+    let page_names = Rc::new(
+        page_groups
+            .iter()
+            .flat_map(|(_, pages)| pages.iter())
+            .map(|(id, title, _, _)| ((*id).to_string(), (*title).to_string()))
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
+    let history = Rc::new(RefCell::new(vec!["account".to_string()]));
+    let history_index = Rc::new(Cell::new(0_usize));
+
+    for (_, pages) in &page_groups {
+        for (id, title, description, _) in *pages {
+            let page = settings_page(title, description);
+            match *id {
+                "wifi" => {
+                    let card = settings_card("Wireless", "Toggle Wi-Fi using NetworkManager.");
+                    let controls = GtkBox::new(Orientation::Horizontal, 10);
+                    let radio_state = run_program_output("nmcli", &["radio", "wifi"]);
+                    let is_enabled = radio_state.as_deref() == Ok("enabled");
+                    let status_text = match &radio_state {
+                        Ok(state) => format!("Wi-Fi radio: {state}"),
+                        Err(error) => format!("NetworkManager unavailable: {error}"),
+                    };
+                    let status = Label::new(Some(&status_text));
+                    status.add_css_class("cc-sub");
+                    let toggle = Switch::new();
+                    toggle.set_active(is_enabled);
+                    toggle.set_sensitive(radio_state.is_ok());
+                    let status_ref = status.clone();
+                    let updating = Rc::new(Cell::new(false));
+                    let updating_ref = updating.clone();
+                    toggle.connect_active_notify(move |switch| {
+                        if updating_ref.get() {
+                            return;
+                        }
+                        let requested = switch.is_active();
+                        let action = if requested { "on" } else { "off" };
+                        match run_program_output("nmcli", &["radio", "wifi", action]) {
+                            Ok(_) => status_ref.set_text(if requested {
+                                "Wi-Fi radio: enabled"
+                            } else {
+                                "Wi-Fi radio: disabled"
+                            }),
+                            Err(error) => {
+                                status_ref.set_text(&format!("Could not change Wi-Fi: {error}"));
+                                updating_ref.set(true);
+                                switch.set_active(!requested);
+                                updating_ref.set(false);
+                            }
+                        }
+                    });
+                    controls.append(&status);
+                    controls.append(&toggle);
+                    card.append(&controls);
+                    page.append(&card);
+                    add_settings_tool(&page, "Open connection editor", "nm-connection-editor", &[]);
+
+                    let profiles_card = settings_card(
+                        "Saved Wi-Fi Networks",
+                        "Connect to saved profiles or remove profiles from NetworkManager.",
+                    );
+                    let profiles_status = Label::new(None);
+                    profiles_status.add_css_class("cc-sub");
+                    profiles_status.set_halign(Align::Start);
+                    profiles_card.append(&profiles_status);
+                    let profiles_list = GtkBox::new(Orientation::Vertical, 6);
+                    profiles_card.append(&profiles_list);
+                    let refresh_profiles = Button::with_label("Refresh Saved Networks");
+                    refresh_profiles.add_css_class("flat");
+                    refresh_profiles.add_css_class("menu-action-btn");
+                    let profiles_list_ref = profiles_list.clone();
+                    let profiles_status_ref = profiles_status.clone();
+                    refresh_profiles.connect_clicked(move |_| {
+                        refresh_saved_wifi_profiles(&profiles_list_ref, &profiles_status_ref);
+                    });
+                    profiles_card.append(&refresh_profiles);
+                    refresh_saved_wifi_profiles(&profiles_list, &profiles_status);
+                    page.append(&profiles_card);
+                }
+                "bluetooth" => {
+                    let card =
+                        settings_card("Bluetooth radio", "Power the Bluetooth adapter on or off.");
+                    let controls = GtkBox::new(Orientation::Horizontal, 10);
+                    let powered = run_program_output("bluetoothctl", &["show"])
+                        .and_then(|output| {
+                            parse_bluetooth_powered(&output)
+                                .ok_or_else(|| "BlueZ did not report adapter power state.".into())
+                        });
+                    let status_text = match &powered {
+                        Ok(true) => "Bluetooth is on".to_string(),
+                        Ok(false) => "Bluetooth is off".to_string(),
+                        Err(error) => format!("Bluetooth unavailable: {error}"),
+                    };
+                    let status = Label::new(Some(&status_text));
+                    status.add_css_class("cc-sub");
+                    let toggle = Switch::new();
+                    toggle.set_active(powered.as_ref() == Ok(&true));
+                    toggle.set_sensitive(powered.is_ok());
+                    let status_ref = status.clone();
+                    let updating = Rc::new(Cell::new(false));
+                    let updating_ref = updating.clone();
+                    toggle.connect_active_notify(move |switch| {
+                        if updating_ref.get() {
+                            return;
+                        }
+                        let requested = switch.is_active();
+                        let args = vec![
+                            "power".to_string(),
+                            if requested { "on" } else { "off" }.to_string(),
+                        ];
+                        let switch_ref = switch.clone();
+                        let updating_after = updating_ref.clone();
+                        let status_after = status_ref.clone();
+                        run_system_command_async(
+                            "bluetoothctl",
+                            args,
+                            status_ref.clone(),
+                            move |success| {
+                                if !success {
+                                    updating_after.set(true);
+                                    switch_ref.set_active(!requested);
+                                    updating_after.set(false);
+                                } else {
+                                    status_after.set_text(if requested {
+                                        "Bluetooth is on"
+                                    } else {
+                                        "Bluetooth is off"
+                                    });
+                                }
+                            },
+                        );
+                    });
+                    controls.append(&status);
+                    controls.append(&toggle);
+                    card.append(&controls);
+                    page.append(&card);
+
+                    let devices_card = settings_card(
+                        "Bluetooth Devices",
+                        "Paired devices and devices known to BlueZ. Scan to discover nearby devices.",
+                    );
+                    let devices_status = Label::new(None);
+                    devices_status.add_css_class("cc-sub");
+                    devices_status.set_halign(Align::Start);
+                    devices_card.append(&devices_status);
+                    let devices_list = GtkBox::new(Orientation::Vertical, 6);
+                    devices_card.append(&devices_list);
+
+                    let scan_button = Button::with_label("Scan for Devices");
+                    scan_button.add_css_class("flat");
+                    scan_button.add_css_class("menu-action-btn");
+                    let scan_status = devices_status.clone();
+                    let scan_list = devices_list.clone();
+                    scan_button.connect_clicked(move |_| {
+                        let status_after = scan_status.clone();
+                        let list_after = scan_list.clone();
+                        run_system_command_async(
+                            "bluetoothctl",
+                            vec![
+                                "--timeout".to_string(),
+                                "12".to_string(),
+                                "scan".to_string(),
+                                "on".to_string(),
+                            ],
+                            scan_status.clone(),
+                            move |success| {
+                                if success {
+                                    refresh_bluetooth_devices(&list_after, &status_after);
+                                }
+                            },
+                        );
+                        scan_status.set_text("Scanning for nearby devices...");
+                    });
+                    devices_card.append(&scan_button);
+                    let manager_button = Button::with_label("Open Bluetooth Manager");
+                    manager_button.add_css_class("flat");
+                    manager_button.add_css_class("menu-action-btn");
+                    let manager_status = devices_status.clone();
+                    manager_button.connect_clicked(move |_| {
+                        match launch_program("blueman-manager", &[]) {
+                            Ok(()) => manager_status.set_text(
+                                "Opened Blueman to confirm pairing and device authorization.",
+                            ),
+                            Err(error) => manager_status
+                                .set_text(&format!("Bluetooth manager unavailable: {error}")),
+                        }
+                    });
+                    devices_card.append(&manager_button);
+                    refresh_bluetooth_devices(&devices_list, &devices_status);
+                    page.append(&devices_card);
+                }
+                "sound" => {
+                    let card = settings_card("Output volume", "Adjust the default audio output.");
+                    let slider = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+                    if let Ok(volume) = run_cmd_output("pamixer --get-volume").parse::<f64>() {
+                        slider.set_value(volume);
+                    }
+                    slider.connect_value_changed(|scale| {
+                        launch_app(&format!(
+                            "pamixer --set-volume {}",
+                            scale.value().round() as u32
+                        ));
+                    });
+                    card.append(&slider);
+                    page.append(&card);
+                    add_settings_tool(&page, "Open audio mixer", "pavucontrol", &[]);
+                }
+                "battery" => {
+                    let (capacity, state) = read_battery_info();
+                    page.append(&settings_card(
+                        "Battery",
+                        &format!("Charge: {capacity} · State: {state}"),
+                    ));
+                    let (health, cycles) = read_battery_health();
+                    page.append(&settings_card(
+                        "Battery Health",
+                        &format!(
+                            "Maximum capacity: {}\nCycle count: {}",
+                            health.unwrap_or_else(|| "Not reported by hardware".to_string()),
+                            cycles.unwrap_or_else(|| "Not reported by hardware".to_string())
+                        ),
+                    ));
+                    add_settings_tool(
+                        &page,
+                        "Open power settings",
+                        "gnome-control-center",
+                        &["power"],
+                    );
+                }
+                "general" => {
+                    let hostname = std::fs::read_to_string("/etc/hostname")
+                        .map(|name| name.trim().to_string())
+                        .ok()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "Not reported by the system".to_string());
+                    page.append(&settings_card(
+                        "About This Device",
+                        &format!(
+                            "{} · {hostname}\nProcessor: {}\nMemory: {}\nHardware serial: Not exposed by the user session",
+                            os_display_name(),
+                            cpu_display_name(),
+                            memory_display_size()
+                        ),
+                    ));
+                    let clock_card = settings_card(
+                        "Date & Time",
+                        "Choose how the MARCH SCARA menu bar displays the local time.",
+                    );
+                    let clock_24_hour = Switch::new();
+                    clock_24_hour.set_active(preferences.borrow().clock_24_hour);
+                    clock_card.append(&settings_control_row(
+                        "24-hour clock",
+                        &clock_24_hour,
+                    ));
+                    let clock_status = Label::new(Some("Uses the system's current local time zone."));
+                    clock_status.add_css_class("cc-sub");
+                    clock_status.set_halign(Align::Start);
+                    clock_card.append(&clock_status);
+                    let clock_preferences = preferences.clone();
+                    let clock_window = window.clone();
+                    let clock_widgets = menu_bar_widgets.clone();
+                    let clock_status_ref = clock_status.clone();
+                    clock_24_hour.connect_active_notify(move |switch| {
+                        let use_24_hour = switch.is_active();
+                        if persist_settings_change(
+                            &clock_preferences,
+                            &clock_window,
+                            &clock_status_ref,
+                            |settings| settings.clock_24_hour = use_24_hour,
+                        ) {
+                            update_clock_widget(&clock_widgets, &clock_preferences.borrow());
+                        }
+                    });
+                    page.append(&clock_card);
+                    match root_storage_display() {
+                        Ok((summary, used_fraction)) => {
+                            let storage_card = settings_card("Storage", &summary);
+                            let usage_bar = ProgressBar::new();
+                            usage_bar.set_fraction(used_fraction);
+                            usage_bar.set_show_text(true);
+                            usage_bar.set_text(Some(&format!(
+                                "{:.0}% of the root filesystem is used",
+                                used_fraction * 100.0
+                            )));
+                            storage_card.append(&usage_bar);
+                            page.append(&storage_card);
+                        }
+                        Err(error) => add_settings_integration_note(
+                            &page,
+                            "Storage",
+                            &format!("Usage data is unavailable: {error}"),
+                        ),
+                    }
+                    add_settings_tool(
+                        &page,
+                        "Open system information",
+                        "gnome-control-center",
+                        &["about"],
+                    );
+                    add_settings_integration_note(
+                        &page,
+                        "Updates, storage, and startup items",
+                        "System update management, storage breakdowns, and login-item editing are not connected in this release.",
+                    );
+                }
+                "keyboard" => {
+                    page.append(&settings_card(
+                        "MARCH SCARA shortcuts",
+                        "Super+Return: terminal · Super+E: files · Super+Q: close · Super+1–5: workspaces · Super alone: app launcher.",
+                    ));
+                    add_settings_tool(
+                        &page,
+                        "Open keyboard settings",
+                        "gnome-control-center",
+                        &["keyboard"],
+                    );
+                }
+                "mouse" => {
+                    page.append(&settings_card(
+                        "Pointer",
+                        "Pointer settings are applied by libinput. Tap-to-click is enabled when supported by the device.",
+                    ));
+                    add_settings_tool(
+                        &page,
+                        "Open mouse settings",
+                        "gnome-control-center",
+                        &["mouse"],
+                    );
+                }
+                "display" => add_settings_tool(&page, "Open display controls", "wdisplays", &[]),
+                "appearance" => {
+                    let card = settings_card(
+                        "Personalize your desktop",
+                        "These preferences are saved for your user and applied immediately to MARCH SCARA Settings.",
+                    );
+                    let theme = DropDown::from_strings(&["Automatic", "Light", "Dark"]);
+                    theme.set_selected(match preferences.borrow().theme {
+                        ThemeMode::Auto => 0,
+                        ThemeMode::Light => 1,
+                        ThemeMode::Dark => 2,
+                    });
+                    card.append(&settings_control_row("Appearance", &theme));
+
+                    let accent = DropDown::from_strings(&[
+                        "Blue", "Purple", "Pink", "Red", "Orange", "Yellow", "Green", "Graphite",
+                    ]);
+                    accent.set_selected(match preferences.borrow().accent {
+                        AccentColor::Blue => 0,
+                        AccentColor::Purple => 1,
+                        AccentColor::Pink => 2,
+                        AccentColor::Red => 3,
+                        AccentColor::Orange => 4,
+                        AccentColor::Yellow => 5,
+                        AccentColor::Green => 6,
+                        AccentColor::Graphite => 7,
+                    });
+                    card.append(&settings_control_row("Accent color", &accent));
+
+                    let glass = DropDown::from_strings(&["Standard Glass", "Clear", "Tinted"]);
+                    glass.set_selected(match preferences.borrow().glass {
+                        GlassStyle::Standard => 0,
+                        GlassStyle::Clear => 1,
+                        GlassStyle::Tinted => 2,
+                    });
+                    card.append(&settings_control_row("Glass material", &glass));
+
+                    let reduce_transparency = Switch::new();
+                    reduce_transparency
+                        .set_active(preferences.borrow().reduce_transparency);
+                    card.append(&settings_control_row(
+                        "Reduce transparency",
+                        &reduce_transparency,
+                    ));
+
+                    let status = Label::new(Some(
+                        preferences_error
+                            .as_deref()
+                            .unwrap_or("Changes apply immediately."),
+                    ));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+                    status.set_wrap(true);
+                    card.append(&status);
+                    page.append(&card);
+
+                    let preferences_ref = preferences.clone();
+                    let window_ref = window.clone();
+                    let status_ref = status.clone();
+                    theme.connect_selected_notify(move |dropdown| {
+                        let value = match dropdown.selected() {
+                            0 => ThemeMode::Auto,
+                            1 => ThemeMode::Light,
+                            2 => ThemeMode::Dark,
+                            _ => return,
+                        };
+                        persist_settings_change(
+                            &preferences_ref,
+                            &window_ref,
+                            &status_ref,
+                            |settings| settings.theme = value,
+                        );
+                    });
+
+                    let preferences_ref = preferences.clone();
+                    let window_ref = window.clone();
+                    let status_ref = status.clone();
+                    accent.connect_selected_notify(move |dropdown| {
+                        let value = match dropdown.selected() {
+                            0 => AccentColor::Blue,
+                            1 => AccentColor::Purple,
+                            2 => AccentColor::Pink,
+                            3 => AccentColor::Red,
+                            4 => AccentColor::Orange,
+                            5 => AccentColor::Yellow,
+                            6 => AccentColor::Green,
+                            7 => AccentColor::Graphite,
+                            _ => return,
+                        };
+                        persist_settings_change(
+                            &preferences_ref,
+                            &window_ref,
+                            &status_ref,
+                            |settings| settings.accent = value,
+                        );
+                    });
+
+                    let preferences_ref = preferences.clone();
+                    let window_ref = window.clone();
+                    let status_ref = status.clone();
+                    glass.connect_selected_notify(move |dropdown| {
+                        let value = match dropdown.selected() {
+                            0 => GlassStyle::Standard,
+                            1 => GlassStyle::Clear,
+                            2 => GlassStyle::Tinted,
+                            _ => return,
+                        };
+                        persist_settings_change(
+                            &preferences_ref,
+                            &window_ref,
+                            &status_ref,
+                            |settings| settings.glass = value,
+                        );
+                    });
+
+                    let preferences_ref = preferences.clone();
+                    let window_ref = window.clone();
+                    let status_ref = status.clone();
+                    reduce_transparency.connect_active_notify(move |switch| {
+                        let value = switch.is_active();
+                        persist_settings_change(
+                            &preferences_ref,
+                            &window_ref,
+                            &status_ref,
+                            |settings| settings.reduce_transparency = value,
+                        );
+                    });
+                    add_settings_tool(
+                        &page,
+                        "Open appearance settings",
+                        "gnome-control-center",
+                        &["appearance"],
+                    );
+                }
+                "wallpaper" => {
+                    let current_wallpaper = find_wallpaper_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "Built-in MARCH SCARA background".to_string());
+                    let card = settings_card(
+                        "Desktop wallpaper",
+                        &format!("Current image: {current_wallpaper}"),
+                    );
+                    let choose_wallpaper = Button::with_label("Choose Image…");
+                    choose_wallpaper.add_css_class("flat");
+                    choose_wallpaper.add_css_class("menu-action-btn");
+                    let status = Label::new(Some(
+                        "Select a JPG, PNG, or WebP image to apply it to the desktop.",
+                    ));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+                    status.set_wrap(true);
+
+                    let settings_window = window.clone();
+                    let wallpaper_picture = wallpaper_picture.clone();
+                    let preferences_ref = preferences.clone();
+                    let status_ref = status.clone();
+                    choose_wallpaper.connect_clicked(move |_| {
+                        let chooser = FileChooserNative::new(
+                            Some("Choose Desktop Wallpaper"),
+                            Some(&settings_window),
+                            FileChooserAction::Open,
+                            Some("Select"),
+                            Some("Cancel"),
+                        );
+                        let picture = wallpaper_picture.clone();
+                        let preferences = preferences_ref.clone();
+                        let status = status_ref.clone();
+                        chooser.connect_response(move |dialog, response| {
+                            if response == ResponseType::Accept {
+                                let selected_path = dialog.file().and_then(|file| file.path());
+                                match selected_path {
+                                    Some(path) => match preferences::validate_wallpaper(&path) {
+                                        Ok(()) => {
+                                            let saved_path = path.clone();
+                                            match update_preferences(&preferences, |settings| {
+                                                settings.wallpaper = Some(saved_path);
+                                            }) {
+                                                Ok(()) => {
+                                                    if let Some(filename) = path.to_str() {
+                                                        picture.set_filename(Some(filename));
+                                                        status.set_text("Wallpaper updated and saved.");
+                                                    } else {
+                                                        status.set_text(
+                                                            "The selected file path is not valid UTF-8.",
+                                                        );
+                                                    }
+                                                }
+                                                Err(error) => status.set_text(&format!(
+                                                    "Could not save wallpaper setting: {error}"
+                                                )),
+                                            }
+                                        }
+                                        Err(error) => {
+                                            status.set_text(&format!("Cannot use image: {error}"))
+                                        }
+                                    },
+                                    None => status.set_text(
+                                        "Could not read the selected image path.",
+                                    ),
+                                }
+                            }
+                            dialog.destroy();
+                        });
+                        chooser.show();
+                    });
+                    card.append(&choose_wallpaper);
+                    card.append(&status);
+                    page.append(&card);
+                    add_settings_integration_note(
+                        &page,
+                        "Screen saver",
+                        "Screen-saver scheduling and lock-screen clock options are not yet managed here.",
+                    );
+                }
+                "network" => add_settings_tool(
+                    &page,
+                    "Open network connections",
+                    "nm-connection-editor",
+                    &[],
+                ),
+                "notifications" => {
+                    page.append(&settings_card(
+                        "Notifications",
+                        "Mako is started with the MARCH SCARA session and receives standard Wayland desktop notifications.",
+                    ));
+                    add_settings_integration_note(
+                        &page,
+                        "Notification preferences & Focus",
+                        "Per-application rules, schedules, and Do Not Disturb controls are not yet exposed in MARCH SCARA Settings.",
+                    );
+                }
+                "accessibility" => {
+                    let card = settings_card(
+                        "Display",
+                        "Reduce transparency is applied to MARCH SCARA's Liquid Glass surfaces.",
+                    );
+                    let reduce_transparency = Switch::new();
+                    reduce_transparency.set_active(preferences.borrow().reduce_transparency);
+                    card.append(&settings_control_row(
+                        "Reduce transparency",
+                        &reduce_transparency,
+                    ));
+                    let status = Label::new(Some("Changes apply immediately."));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+                    card.append(&status);
+                    let preferences_ref = preferences.clone();
+                    let window_ref = window.clone();
+                    let status_ref = status.clone();
+                    reduce_transparency.connect_active_notify(move |switch| {
+                        let value = switch.is_active();
+                        persist_settings_change(
+                            &preferences_ref,
+                            &window_ref,
+                            &status_ref,
+                            |settings| settings.reduce_transparency = value,
+                        );
+                    });
+                    page.append(&card);
+                    add_settings_tool(
+                        &page,
+                        "Open accessibility settings",
+                        "gnome-control-center",
+                        &["universal-access"],
+                    );
+                }
+                "privacy" => {
+                    add_settings_integration_note(
+                        &page,
+                        "Application permissions",
+                        "Use the host desktop's privacy controls and XDG Desktop Portal permission prompts. MARCH SCARA does not maintain a separate permission database.",
+                    );
+                    add_settings_integration_note(
+                        &page,
+                        "Administrator actions",
+                        "System tools should request authorization through Polkit. MARCH SCARA does not collect or store administrator passwords.",
+                    );
+                    add_settings_tool(
+                        &page,
+                        "Open GNOME privacy settings",
+                        "gnome-control-center",
+                        &["privacy"],
+                    );
+                }
+                "apps" | "search" => {
+                    let card = settings_card(
+                        "Installed applications",
+                        "Use the MARCH SCARA application grid to search and launch desktop apps.",
+                    );
+                    let button = Button::with_label("Open application grid");
+                    button.add_css_class("flat");
+                    button.add_css_class("menu-action-btn");
+                    let app = app.clone();
+                    button.connect_clicked(move |_| {
+                        if let Some(window) = app
+                            .windows()
+                            .into_iter()
+                            .find(|window| window.title().as_deref() == Some("Applications"))
+                        {
+                            window.present();
+                        }
+                    });
+                    card.append(&button);
+                    page.append(&card);
+                    add_settings_tool(
+                        &page,
+                        "Default application settings",
+                        "gnome-control-center",
+                        &["applications"],
+                    );
+                }
+                "account" => {
+                    let card = settings_card(
+                        "Local Profile",
+                        "The display name and avatar are stored in this user account.",
+                    );
+                    let display_name = Entry::new();
+                    display_name.set_placeholder_text(Some("Display name"));
+                    display_name.set_text(profile_name.label().as_str());
+                    display_name.set_hexpand(true);
+                    card.append(&settings_control_row("Display name", &display_name));
+
+                    let choose_avatar = Button::with_label("Choose Profile Photo…");
+                    choose_avatar.add_css_class("flat");
+                    choose_avatar.add_css_class("menu-action-btn");
+                    card.append(&choose_avatar);
+
+                    let status = Label::new(Some(
+                        "Press Enter in the name field to apply the display name.",
+                    ));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+                    status.set_wrap(true);
+                    card.append(&status);
+                    page.append(&card);
+
+                    let preferences_ref = preferences.clone();
+                    let status_ref = status.clone();
+                    let profile_name_ref = profile_name.clone();
+                    display_name.connect_activate(move |entry| {
+                        let name = entry.text().trim().to_string();
+                        if name.is_empty() {
+                            status_ref.set_text("Display name cannot be empty.");
+                            return;
+                        }
+                        match update_preferences(&preferences_ref, |settings| {
+                            settings.display_name = Some(name.clone());
+                        }) {
+                            Ok(()) => {
+                                profile_name_ref.set_text(&name);
+                                status_ref.set_text("Display name updated.");
+                            }
+                            Err(error) => {
+                                status_ref.set_text(&format!("Could not save profile: {error}"))
+                            }
+                        }
+                    });
+
+                    let preferences_ref = preferences.clone();
+                    let status_ref = status.clone();
+                    let avatar_ref = avatar.clone();
+                    let settings_window = window.clone();
+                    choose_avatar.connect_clicked(move |_| {
+                        let chooser = FileChooserNative::new(
+                            Some("Choose Profile Photo"),
+                            Some(&settings_window),
+                            FileChooserAction::Open,
+                            Some("Select"),
+                            Some("Cancel"),
+                        );
+                        let preferences = preferences_ref.clone();
+                        let status = status_ref.clone();
+                        let avatar = avatar_ref.clone();
+                        chooser.connect_response(move |dialog, response| {
+                            if response == ResponseType::Accept {
+                                let path = dialog.file().and_then(|file| file.path());
+                                match path {
+                                    Some(path) => match preferences::validate_wallpaper(&path) {
+                                        Ok(()) => {
+                                            let saved_path = path.clone();
+                                            match update_preferences(&preferences, |settings| {
+                                                settings.avatar = Some(saved_path);
+                                            }) {
+                                                Ok(()) => {
+                                                    if let Some(filename) = path.to_str() {
+                                                        avatar.set_from_file(Some(filename));
+                                                        status.set_text("Profile photo updated.");
+                                                    } else {
+                                                        status.set_text(
+                                                            "The selected file path is not valid UTF-8.",
+                                                        );
+                                                    }
+                                                }
+                                                Err(error) => status.set_text(&format!(
+                                                    "Could not save profile photo: {error}"
+                                                )),
+                                            }
+                                        }
+                                        Err(error) => {
+                                            status.set_text(&format!("Cannot use image: {error}"))
+                                        }
+                                    },
+                                    None => status.set_text(
+                                        "Could not read the selected image path.",
+                                    ),
+                                }
+                            }
+                            dialog.destroy();
+                        });
+                        chooser.show();
+                    });
+
+                    page.append(&settings_card(
+                        "Sign-in and password",
+                        "Linux account authentication is managed by the host operating system. MARCH SCARA never stores account passwords.",
+                    ));
+                    add_settings_tool(
+                        &page,
+                        "Open GNOME user settings",
+                        "gnome-control-center",
+                        &["users"],
+                    );
+                }
+                "desktop_dock" => {
+                    page.append(&settings_card(
+                        "Workspaces and windows",
+                        "Use Super+1–5 to switch workspaces, Super+Shift+1–5 to move a window, Super+F to toggle floating, and Super+T to toggle layout.",
+                    ));
+                    add_settings_integration_note(
+                        &page,
+                        "Dock & window behavior",
+                        "Dock placement, auto-hide, magnification, hot corners, and Stage Manager controls are not yet configurable here.",
+                    );
+                }
+                "control_center" => {
+                    let card = settings_card(
+                        "Menu bar modules",
+                        "Choose which MARCH SCARA controls remain visible. Changes apply immediately.",
+                    );
+                    let status = Label::new(Some(
+                        "Preferences are stored for your local user account.",
+                    ));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+
+                    for (title, module) in [
+                        ("Bluetooth", "bluetooth"),
+                        ("Battery", "battery"),
+                        ("Wi-Fi", "wifi"),
+                        ("Spotlight", "spotlight"),
+                        ("Control Center", "control_center"),
+                        ("Clock", "clock"),
+                        ("Sound in Control Center", "sound"),
+                    ] {
+                        let toggle = Switch::new();
+                        toggle.set_active(menu_bar_module_visible(
+                            &preferences.borrow().menu_bar,
+                            module,
+                        ));
+                        card.append(&settings_control_row(title, &toggle));
+
+                        let preferences_ref = preferences.clone();
+                        let window_ref = window.clone();
+                        let status_ref = status.clone();
+                        let widgets_ref = menu_bar_widgets.clone();
+                        let module = module.to_string();
+                        toggle.connect_active_notify(move |switch| {
+                            let visible = switch.is_active();
+                            if persist_settings_change(
+                                &preferences_ref,
+                                &window_ref,
+                                &status_ref,
+                                |settings| {
+                                    update_menu_bar_module(settings, &module, visible);
+                                },
+                            ) {
+                                set_menu_bar_module_visibility(
+                                    &widgets_ref,
+                                    &preferences_ref.borrow(),
+                                );
+                            }
+                        });
+                    }
+                    card.append(&status);
+                    page.append(&card);
+                }
+                "lock_screen" => add_settings_integration_note(
+                    &page,
+                    "Lock screen",
+                    "Lock-screen messages, idle timers, and sleep authentication are managed by the host system, not MARCH SCARA.",
+                ),
+                "passwords" => add_settings_tool(
+                    &page,
+                    "Open password manager",
+                    "seahorse",
+                    &[],
+                ),
+                "trackpad" => {
+                    add_settings_integration_note(
+                        &page,
+                        "Trackpad gestures",
+                        "Gesture configuration is currently managed by the system input stack.",
+                    );
+                    add_settings_tool(
+                        &page,
+                        "Open touchpad settings",
+                        "gnome-control-center",
+                        &["mouse"],
+                    );
+                }
+                "printers" => add_settings_tool(
+                    &page,
+                    "Open printer settings",
+                    "system-config-printer",
+                    &[],
+                ),
+                "multitasking" => page.append(&settings_card(
+                    "Workspaces and windows",
+                    "Use Super+1–5 to switch workspaces, Super+Shift+1–5 to move a window, Super+F to toggle floating, and Super+T to toggle layout.",
+                )),
+                _ => add_settings_integration_note(
+                    &page,
+                    "Integration status",
+                    "This panel does not yet have a MARCH SCARA system integration.",
+                ),
+            }
+
+            let scrolled_page = ScrolledWindow::new();
+            scrolled_page.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+            scrolled_page.set_child(Some(&page));
+            stack.add_titled(&scrolled_page, Some(id), title);
+        }
+    }
+
+    for (group_title, pages) in &page_groups {
+        let group = GtkBox::new(Orientation::Vertical, 2);
+        let heading = Label::new(Some(group_title));
+        heading.add_css_class("settings-section-title");
+        heading.set_halign(Align::Start);
+        group.append(&heading);
+
+        let mut rows = Vec::new();
+        for (id, title, _, keywords) in *pages {
+            let button = Button::with_label(title);
+            button.add_css_class("settings-nav-button");
+            let stack = stack.clone();
+            let page_title = page_title.clone();
+            let history = history.clone();
+            let history_index = history_index.clone();
+            let buttons_for_selection = active_buttons.clone();
+            let back = back.clone();
+            let forward = forward.clone();
+            let id = (*id).to_string();
+            let title = (*title).to_string();
+            let searchable_text = format!(
+                "{} {} {}",
+                title.to_lowercase(),
+                keywords.to_lowercase(),
+                id
+            );
+            button.connect_clicked(move |selected| {
+                let mut entries = history.borrow_mut();
+                let index = history_index.get();
+                entries.truncate(index + 1);
+                if entries.last() != Some(&id) {
+                    entries.push(id.clone());
+                }
+                let new_index = entries.len().saturating_sub(1);
+                history_index.set(new_index);
+                stack.set_visible_child_name(&id);
+                page_title.set_text(&title);
+                back.set_sensitive(new_index > 0);
+                forward.set_sensitive(false);
+                for item in buttons_for_selection.borrow().iter() {
+                    item.remove_css_class("selected");
+                }
+                selected.add_css_class("selected");
+            });
+            rows.push((button.clone(), searchable_text));
+            active_buttons.borrow_mut().push(button.clone());
+            group.append(&button);
+        }
+        nav_content.append(&group);
+        search_groups.borrow_mut().push((group, rows));
+    }
+
+    if let Some(first) = active_buttons.borrow().first() {
+        first.add_css_class("selected");
+    }
+
+    let search_groups_ref = search_groups.clone();
+    let no_results_ref = no_results.clone();
+    search.connect_search_changed(move |entry| {
+        let query = entry.text().trim().to_lowercase();
+        let mut any_group_visible = false;
+        for (group, rows) in search_groups_ref.borrow().iter() {
+            let mut group_visible = false;
+            for (button, searchable_text) in rows {
+                let is_match = settings_search_matches(&query, searchable_text);
+                button.set_visible(is_match);
+                group_visible |= is_match;
+            }
+            group.set_visible(group_visible);
+            any_group_visible |= group_visible;
+        }
+        no_results_ref.set_visible(!query.is_empty() && !any_group_visible);
+    });
+
+    let history_ref = history.clone();
+    let history_index_ref = history_index.clone();
+    let stack_ref = stack.clone();
+    let title_ref = page_title.clone();
+    let back_ref = back.clone();
+    let forward_ref = forward.clone();
+    let active_buttons_ref = active_buttons.clone();
+    let page_names_ref = page_names.clone();
+    back.connect_clicked(move |_| {
+        let current = history_index_ref.get();
+        if current == 0 {
+            return;
+        }
+        let next = current - 1;
+        history_index_ref.set(next);
+        if let Some(id) = history_ref.borrow().get(next) {
+            stack_ref.set_visible_child_name(id);
+            if let Some(title) = page_names_ref.get(id) {
+                title_ref.set_text(title);
+            }
+            for button in active_buttons_ref.borrow().iter() {
+                button.remove_css_class("selected");
+                if button.label().as_deref() == page_names_ref.get(id).map(String::as_str) {
+                    button.add_css_class("selected");
+                }
+            }
+        }
+        back_ref.set_sensitive(next > 0);
+        forward_ref.set_sensitive(true);
+    });
+
+    let history_ref = history.clone();
+    let history_index_ref = history_index.clone();
+    let stack_ref = stack.clone();
+    let title_ref = page_title.clone();
+    let back_ref = back.clone();
+    let forward_ref = forward.clone();
+    let active_buttons_ref = active_buttons.clone();
+    let page_names_ref = page_names.clone();
+    forward.connect_clicked(move |_| {
+        let next = history_index_ref.get() + 1;
+        let entries = history_ref.borrow();
+        if next >= entries.len() {
+            return;
+        }
+        history_index_ref.set(next);
+        if let Some(id) = entries.get(next) {
+            stack_ref.set_visible_child_name(id);
+            if let Some(title) = page_names_ref.get(id) {
+                title_ref.set_text(title);
+            }
+            for button in active_buttons_ref.borrow().iter() {
+                button.remove_css_class("selected");
+                if button.label().as_deref() == page_names_ref.get(id).map(String::as_str) {
+                    button.add_css_class("selected");
+                }
+            }
+        }
+        back_ref.set_sensitive(true);
+        forward_ref.set_sensitive(next + 1 < entries.len());
+    });
+
+    for button in [back.clone(), forward.clone()] {
+        button.add_css_class("flat");
+    }
+    layout.append(&sidebar);
+    layout.append(&content);
     window.set_child(Some(&layout));
-    window
+
+    let navigator = {
+        let window = window.clone();
+        let stack = stack.clone();
+        let search = search.clone();
+        let page_title = page_title.clone();
+        let page_names = page_names.clone();
+        let history = history.clone();
+        let history_index = history_index.clone();
+        let back = back.clone();
+        let forward = forward.clone();
+        let active_buttons = active_buttons.clone();
+        Rc::new(move |panel: &str| {
+            let Some(title) = page_names.get(panel) else {
+                return;
+            };
+            let mut entries = history.borrow_mut();
+            let index = history_index.get();
+            entries.truncate(index + 1);
+            if entries.last().is_none_or(|current| current != panel) {
+                entries.push(panel.to_string());
+            }
+            let current_index = entries.len().saturating_sub(1);
+            history_index.set(current_index);
+            stack.set_visible_child_name(panel);
+            page_title.set_text(title);
+            search.set_text("");
+            for button in active_buttons.borrow().iter() {
+                button.remove_css_class("selected");
+                if button.label().as_deref() == Some(title.as_str()) {
+                    button.add_css_class("selected");
+                }
+            }
+            back.set_sensitive(current_index > 0);
+            forward.set_sensitive(false);
+            window.present();
+        }) as SettingsNavigator
+    };
+
+    (window, navigator)
+}
+
+#[cfg(test)]
+mod settings_search_tests {
+    use super::{
+        battery_health_percentage, clock_format_string, launcher_entry_matches,
+        menu_bar_module_visible, parse_bluetooth_devices, parse_bluetooth_powered,
+        parse_storage_row, parse_wifi_networks, parse_wifi_profiles, settings_panel_from_uri,
+        settings_search_matches, update_menu_bar_module, DesktopApp,
+    };
+    use crate::preferences::UserPreferences;
+
+    #[test]
+    fn search_supports_common_indonesian_terms_and_actions() {
+        assert!(settings_search_matches(
+            "layar kuning",
+            "displays resolution refresh rate night shift"
+        ));
+        assert!(settings_search_matches(
+            "matikan bluetooth",
+            "bluetooth paired headphones discoverable"
+        ));
+        assert!(settings_search_matches(
+            "ubah resolusi",
+            "displays resolution refresh rate"
+        ));
+    }
+
+    #[test]
+    fn search_tolerates_a_single_typo() {
+        assert!(settings_search_matches(
+            "bluetooh",
+            "bluetooth paired headphones"
+        ));
+        assert!(!settings_search_matches(
+            "bluetooh",
+            "wireless internet network dns"
+        ));
+    }
+
+    #[test]
+    fn deep_links_resolve_panels_and_subpanels() {
+        assert_eq!(
+            settings_panel_from_uri("mactahoe://settings/privacy/camera"),
+            Some("privacy")
+        );
+        assert_eq!(
+            settings_panel_from_uri("mactahoe://settings/network/wifi?auto-join=true"),
+            Some("wifi")
+        );
+        assert_eq!(
+            settings_panel_from_uri("https://example.com/settings"),
+            None
+        );
+        assert_eq!(
+            settings_panel_from_uri("mactahoe://settings/not-a-panel"),
+            None
+        );
+        assert_eq!(
+            settings_panel_from_uri("mactahoe://settings/continuity"),
+            None
+        );
+        assert_eq!(
+            settings_panel_from_uri("mactahoe://settings/assistant"),
+            None
+        );
+    }
+
+    #[test]
+    fn menu_bar_module_preferences_can_be_updated_independently() {
+        let mut preferences = UserPreferences::default();
+        assert!(menu_bar_module_visible(
+            &preferences.menu_bar,
+            "control_center"
+        ));
+
+        update_menu_bar_module(&mut preferences, "wifi", false);
+        assert!(!menu_bar_module_visible(&preferences.menu_bar, "wifi"));
+        assert!(menu_bar_module_visible(&preferences.menu_bar, "bluetooth"));
+    }
+
+    #[test]
+    fn storage_usage_rows_are_parsed_and_bounded() {
+        let (summary, usage) =
+            parse_storage_row("/dev/root 100G 75G 25G 75% /").expect("valid df row");
+        assert!(summary.contains("100G total"));
+        assert_eq!(usage, 0.75);
+        assert!(parse_storage_row("not a df row").is_err());
+    }
+
+    #[test]
+    fn wifi_scan_rows_decode_escaped_ssids_and_keep_active_network() {
+        let networks = parse_wifi_networks(
+            "*:Cafe\\:Bar:42:WPA2\n:Cafe\\:Bar:93:WPA2\n:Open network:0:--\n::55:WPA3",
+        );
+
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0].ssid, "Cafe:Bar");
+        assert_eq!(networks[0].signal, 42);
+        assert!(networks[0].in_use);
+        assert_eq!(networks[1].ssid, "Open network");
+        assert_eq!(networks[1].security, "Open");
+    }
+
+    #[test]
+    fn saved_wifi_profiles_are_filtered_and_escape_profile_names() {
+        let profiles = parse_wifi_profiles(
+            "Home\\: 5GHz:abc-123:802-11-wireless:wlan0\nWired:xyz-789:802-3-ethernet:eth0",
+        );
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Home: 5GHz");
+        assert_eq!(profiles[0].uuid, "abc-123");
+        assert!(profiles[0].active);
+    }
+
+    #[test]
+    fn bluetooth_devices_merge_paired_and_connected_state() {
+        let devices = parse_bluetooth_devices(
+            "Device AA:BB:CC:DD:EE:FF Headphones",
+            "Device AA:BB:CC:DD:EE:FF Headphones\nDevice 00:11:22:33:44:55 Keyboard",
+            "Device AA:BB:CC:DD:EE:FF Headphones",
+        );
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].name, "Headphones");
+        assert!(devices[0].paired);
+        assert!(devices[0].connected);
+        assert!(!devices[1].paired);
+        assert!(!devices[1].connected);
+    }
+
+    #[test]
+    fn bluetooth_power_state_parser_requires_known_value() {
+        assert_eq!(parse_bluetooth_powered("Powered: yes\n"), Some(true));
+        assert_eq!(parse_bluetooth_powered("Powered: no\n"), Some(false));
+        assert_eq!(parse_bluetooth_powered("No controller available"), None);
+    }
+
+    #[test]
+    fn launcher_search_keeps_application_matching_and_settings_synonyms() {
+        let terminal = DesktopApp {
+            name: "Terminal".to_string(),
+            exec: "kitty".to_string(),
+            icon: "terminal".to_string(),
+        };
+        assert!(launcher_entry_matches("terminal", &terminal));
+
+        let bluetooth_settings = DesktopApp {
+            name: "Bluetooth Settings".to_string(),
+            exec: "__scara_settings__:bluetooth".to_string(),
+            icon: "settings".to_string(),
+        };
+        assert!(launcher_entry_matches(
+            "matikan bluetooth",
+            &bluetooth_settings
+        ));
+    }
+
+    #[test]
+    fn clock_format_follows_the_selected_hour_cycle() {
+        assert!(clock_format_string(true).contains("%H"));
+        assert!(clock_format_string(false).contains("%p"));
+    }
+
+    #[test]
+    fn battery_health_is_only_reported_for_valid_design_capacity() {
+        assert_eq!(battery_health_percentage(80, 100), Some(80.0));
+        assert_eq!(battery_health_percentage(120, 100), Some(100.0));
+        assert_eq!(battery_health_percentage(80, 0), None);
+    }
 }
 
 enum MenuAction {
@@ -1055,6 +3225,199 @@ fn make_dropdown_menu(
     mb
 }
 
+fn refresh_wifi_popover(status: &Label, list: &GtkBox) {
+    let radio = match run_program_output("nmcli", &["radio", "wifi"]) {
+        Ok(radio) => radio,
+        Err(error) => {
+            status.set_text(&format!("NetworkManager unavailable: {error}"));
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            return;
+        }
+    };
+    if radio != "enabled" {
+        status.set_text("Wi-Fi is off");
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        return;
+    }
+
+    let output = match run_program_output(
+        "nmcli",
+        &[
+            "-t",
+            "--escape",
+            "yes",
+            "--fields",
+            "IN-USE,SSID,SIGNAL,SECURITY",
+            "device",
+            "wifi",
+            "list",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            status.set_text(&format!("Could not list Wi-Fi networks: {error}"));
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            return;
+        }
+    };
+
+    let networks = parse_wifi_networks(&output);
+    if let Some(active) = networks.iter().find(|network| network.in_use) {
+        status.set_text(&format!("Connected: {}", active.ssid));
+    } else {
+        status.set_text("Not connected");
+    }
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    for network in networks {
+        let label = format!(
+            "{} · {}% · {}",
+            network.ssid, network.signal, network.security
+        );
+        if network.in_use {
+            let connected = Label::new(Some(&format!("Connected · {label}")));
+            connected.set_halign(Align::Start);
+            connected.add_css_class("cc-sub");
+            list.append(&connected);
+            continue;
+        }
+
+        let button = Button::with_label(&label);
+        button.add_css_class("flat");
+        button.add_css_class("menu-action-btn");
+        let ssid = network.ssid;
+        let status_ref = status.clone();
+        button.connect_clicked(move |_| {
+            match Command::new("kitty")
+                .arg("--")
+                .arg("nmcli")
+                .arg("--ask")
+                .args(["device", "wifi", "connect"])
+                .arg(&ssid)
+                .spawn()
+            {
+                Ok(_) => status_ref.set_text("Connection prompt opened in Kitty."),
+                Err(error) => status_ref.set_text(&format!("Could not open Kitty: {error}")),
+            }
+        });
+        list.append(&button);
+    }
+}
+
+fn refresh_saved_wifi_profiles(list: &GtkBox, status: &Label) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    let output = match run_program_output(
+        "nmcli",
+        &[
+            "-t",
+            "--escape",
+            "yes",
+            "--fields",
+            "NAME,UUID,TYPE,DEVICE",
+            "connection",
+            "show",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            status.set_text(&format!("Could not list saved networks: {error}"));
+            return;
+        }
+    };
+
+    let profiles = parse_wifi_profiles(&output);
+    if profiles.is_empty() {
+        status.set_text("No saved Wi-Fi networks.");
+        return;
+    }
+    status.set_text(&format!("{} saved Wi-Fi network(s).", profiles.len()));
+
+    for profile in profiles {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        let name = Label::new(Some(&profile.name));
+        name.set_halign(Align::Start);
+        name.set_hexpand(true);
+        row.append(&name);
+
+        let action = if profile.active {
+            "Disconnect"
+        } else {
+            "Connect"
+        };
+        let action_button = Button::with_label(action);
+        action_button.add_css_class("flat");
+        action_button.add_css_class("menu-action-btn");
+        let args = if profile.active {
+            vec![
+                "connection".to_string(),
+                "down".to_string(),
+                "uuid".to_string(),
+                profile.uuid.clone(),
+            ]
+        } else {
+            vec![
+                "--wait".to_string(),
+                "15".to_string(),
+                "connection".to_string(),
+                "up".to_string(),
+                "uuid".to_string(),
+                profile.uuid.clone(),
+            ]
+        };
+        let status_ref = status.clone();
+        let list_ref = list.clone();
+        action_button.connect_clicked(move |_| {
+            let status_after = status_ref.clone();
+            let list_after = list_ref.clone();
+            run_system_command_async("nmcli", args.clone(), status_ref.clone(), move |success| {
+                if success {
+                    refresh_saved_wifi_profiles(&list_after, &status_after);
+                }
+            });
+        });
+        row.append(&action_button);
+
+        let forget_button = Button::with_label("Forget");
+        forget_button.add_css_class("flat");
+        forget_button.add_css_class("menu-action-btn");
+        let uuid = profile.uuid;
+        let status_ref = status.clone();
+        let list_ref = list.clone();
+        forget_button.connect_clicked(move |_| {
+            let status_after = status_ref.clone();
+            let list_after = list_ref.clone();
+            run_system_command_async(
+                "nmcli",
+                vec![
+                    "connection".to_string(),
+                    "delete".to_string(),
+                    "uuid".to_string(),
+                    uuid.clone(),
+                ],
+                status_ref.clone(),
+                move |success| {
+                    if success {
+                        refresh_saved_wifi_profiles(&list_after, &status_after);
+                    }
+                },
+            );
+        });
+        row.append(&forget_button);
+        list.append(&row);
+    }
+}
+
 fn build_wifi_button() -> MenuButton {
     let mb = MenuButton::new();
     mb.add_css_class("flat");
@@ -1083,59 +3446,70 @@ fn build_wifi_button() -> MenuButton {
     root.append(&status_lbl);
 
     let list_box = GtkBox::new(Orientation::Vertical, 2);
-    root.append(&list_box);
+    let network_scroll = ScrolledWindow::new();
+    network_scroll.set_min_content_height(80);
+    network_scroll.set_max_content_height(220);
+    network_scroll.set_child(Some(&list_box));
+    root.append(&network_scroll);
 
     let toggle_btn = Button::with_label("Toggle Wi-Fi On/Off");
     toggle_btn.add_css_class("flat");
     toggle_btn.add_css_class("menu-action-btn");
     let status_ref2 = status_lbl.clone();
+    let list_ref2 = list_box.clone();
     toggle_btn.connect_clicked(move |_| {
-        let state = run_cmd_output("nmcli radio wifi");
-        if state == "enabled" {
-            launch_app("nmcli radio wifi off");
-            status_ref2.set_text("Wi-Fi: Off");
-        } else {
-            launch_app("nmcli radio wifi on");
-            status_ref2.set_text("Wi-Fi: Turning On...");
+        let state = run_program_output("nmcli", &["radio", "wifi"]);
+        let action = match state {
+            Ok(state) if state == "enabled" => "off",
+            Ok(_) => "on",
+            Err(error) => {
+                status_ref2.set_text(&format!("Could not read Wi-Fi state: {error}"));
+                return;
+            }
+        };
+        match run_program_output("nmcli", &["radio", "wifi", action]) {
+            Ok(_) => refresh_wifi_popover(&status_ref2, &list_ref2),
+            Err(error) => status_ref2.set_text(&format!("Could not change Wi-Fi: {error}")),
         }
     });
     root.append(&toggle_btn);
 
+    let refresh_btn = Button::with_label("Scan for Networks");
+    refresh_btn.add_css_class("flat");
+    refresh_btn.add_css_class("menu-action-btn");
     let status_ref = status_lbl.clone();
     let list_ref = list_box.clone();
-    let pop_ref = pop.clone();
-    pop.connect_show(move |_| {
-        let active =
-            run_cmd_output("nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2");
-        if active.is_empty() {
-            status_ref.set_text("Not Connected");
-        } else {
-            status_ref.set_text(&format!("Connected: {}", active));
-        }
-        while let Some(child) = list_ref.first_child() {
-            list_ref.remove(&child);
-        }
-        let nets = run_cmd_output("nmcli -t -f ssid dev wifi list | grep -v '^$' | head -n 5");
-        for ssid in nets.lines() {
-            let ssid_str = ssid.trim().to_string();
-            let w_row = GtkBox::new(Orientation::Horizontal, 8);
-            let w_ic = Image::from_icon_name("network-wireless-signal-good-symbolic");
-            w_ic.set_pixel_size(14);
-            let w_lbl = Label::new(Some(&ssid_str));
-            w_lbl.set_halign(Align::Start);
-            w_row.append(&w_ic);
-            w_row.append(&w_lbl);
-            let b = Button::builder().child(&w_row).build();
-            b.add_css_class("flat");
-            b.add_css_class("menu-action-btn");
-            let p_close = pop_ref.clone();
-            b.connect_clicked(move |_| {
-                launch_app(&format!("nmcli dev wifi connect \"{}\"", ssid_str));
-                p_close.popdown();
-            });
-            list_ref.append(&b);
+    refresh_btn.connect_clicked(move |_| {
+        match run_program_output("nmcli", &["device", "wifi", "rescan"]) {
+            Ok(_) => {
+                status_ref.set_text("Scanning for networks...");
+                let status_after_scan = status_ref.clone();
+                let list_after_scan = list_ref.clone();
+                glib::timeout_add_seconds_local(2, move || {
+                    refresh_wifi_popover(&status_after_scan, &list_after_scan);
+                    glib::ControlFlow::Break
+                });
+            }
+            Err(error) => status_ref.set_text(&format!("Could not scan for networks: {error}")),
         }
     });
+    root.append(&refresh_btn);
+
+    let status_ref = status_lbl.clone();
+    let list_ref = list_box.clone();
+    pop.connect_show(move |_| {
+        refresh_wifi_popover(&status_ref, &list_ref);
+    });
+
+    let editor_btn = Button::with_label("Open Connection Editor");
+    editor_btn.add_css_class("flat");
+    editor_btn.add_css_class("menu-action-btn");
+    let status_ref = status_lbl.clone();
+    editor_btn.connect_clicked(move |_| match launch_program("nm-connection-editor", &[]) {
+        Ok(()) => status_ref.set_text("Opened NetworkManager connection editor."),
+        Err(error) => status_ref.set_text(&format!("Connection editor unavailable: {error}")),
+    });
+    root.append(&editor_btn);
 
     pop.set_child(Some(&root));
     mb.set_popover(Some(&pop));
@@ -1174,25 +3548,44 @@ fn build_bluetooth_button() -> MenuButton {
     toggle_btn.add_css_class("menu-action-btn");
     let s_ref = status_lbl.clone();
     toggle_btn.connect_clicked(move |_| {
-        let powered = run_cmd_output("bluetoothctl show | grep 'Powered:' | awk '{print $2}'");
-        if powered == "yes" {
-            launch_app("bluetoothctl power off");
-            s_ref.set_text("Status: Off");
-        } else {
-            launch_app("bluetoothctl power on");
-            s_ref.set_text("Status: On");
+        let powered = match run_program_output("bluetoothctl", &["show"]).and_then(|output| {
+            parse_bluetooth_powered(&output)
+                .ok_or_else(|| "BlueZ did not report adapter power state.".to_string())
+        }) {
+            Ok(powered) => powered,
+            Err(error) => {
+                s_ref.set_text(&format!("Bluetooth unavailable: {error}"));
+                return;
+            }
+        };
+        let action = if powered { "off" } else { "on" };
+        match run_program_output("bluetoothctl", &["power", action]) {
+            Ok(_) => s_ref.set_text(if powered { "Status: Off" } else { "Status: On" }),
+            Err(error) => s_ref.set_text(&format!("Could not change Bluetooth: {error}")),
         }
     });
     root.append(&toggle_btn);
 
+    let manager_btn = Button::with_label("Open Bluetooth Manager");
+    manager_btn.add_css_class("flat");
+    manager_btn.add_css_class("menu-action-btn");
+    let manager_status = status_lbl.clone();
+    manager_btn.connect_clicked(move |_| match launch_program("blueman-manager", &[]) {
+        Ok(()) => manager_status.set_text("Opened Blueman."),
+        Err(error) => manager_status.set_text(&format!("Bluetooth manager unavailable: {error}")),
+    });
+    root.append(&manager_btn);
+
     let s_show = status_lbl.clone();
     pop.connect_show(move |_| {
-        let powered = run_cmd_output("bluetoothctl show | grep 'Powered:' | awk '{print $2}'");
-        s_show.set_text(if powered == "yes" {
-            "Status: Powered On"
-        } else {
-            "Status: Off"
-        });
+        match run_program_output("bluetoothctl", &["show"]).and_then(|output| {
+            parse_bluetooth_powered(&output)
+                .ok_or_else(|| "BlueZ did not report adapter power state.".to_string())
+        }) {
+            Ok(true) => s_show.set_text("Status: Powered On"),
+            Ok(false) => s_show.set_text("Status: Off"),
+            Err(error) => s_show.set_text(&format!("Bluetooth unavailable: {error}")),
+        }
     });
 
     pop.set_child(Some(&root));
@@ -1297,7 +3690,10 @@ fn build_spotlight_button() -> MenuButton {
     mb
 }
 
-fn build_control_center_popover(settings: &ApplicationWindow) -> Popover {
+fn build_control_center_popover(
+    settings: &ApplicationWindow,
+    menu_bar_widgets: &MenuBarWidgetRegistry,
+) -> Popover {
     let popover = Popover::new();
     popover.set_has_arrow(false);
     popover.set_offset(0, 4);
@@ -1337,6 +3733,9 @@ fn build_control_center_popover(settings: &ApplicationWindow) -> Popover {
     vol_card.append(&vol_lbl);
     vol_card.append(&slider);
     root.append(&vol_card);
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("sound".to_string(), vol_card.clone().upcast());
 
     let settings_btn = Button::with_label("System Settings...");
     settings_btn.add_css_class("flat");
@@ -1374,6 +3773,8 @@ fn build_menubar(
     launcher: &ApplicationWindow,
     launcher_search: &SearchEntry,
     settings: &ApplicationWindow,
+    preferences: &Rc<RefCell<UserPreferences>>,
+    menu_bar_widgets: &MenuBarWidgetRegistry,
 ) {
     let bar_win = ApplicationWindow::builder()
         .application(app)
@@ -1421,9 +3822,9 @@ fn build_menubar(
         None,
         true,
         &[
-            ("Home Folder", MenuAction::Exec("nautilus ~")),
+            ("Home Folder", MenuAction::Exec("thunar ~")),
             ("Applications", MenuAction::Apps),
-            ("Trash", MenuAction::Exec("nautilus trash:///")),
+            ("Trash", MenuAction::Exec("thunar trash:///")),
         ],
         launcher,
         launcher_search,
@@ -1436,7 +3837,7 @@ fn build_menubar(
         false,
         &[
             ("New Terminal Window", MenuAction::Exec("kitty")),
-            ("New Finder Window", MenuAction::Exec("nautilus")),
+            ("New File Manager Window", MenuAction::Exec("thunar")),
             ("New Text Note", MenuAction::Exec("gnome-text-editor")),
             ("---", MenuAction::Separator),
             ("Close Active Window", MenuAction::Ipc("window:close")),
@@ -1454,7 +3855,7 @@ fn build_menubar(
             ("Copy (Clipboard)", MenuAction::Exec("wl-copy")),
             (
                 "Take Screenshot",
-                MenuAction::Exec("grim -g \"$(slurp)\" - | wl-copy"),
+                MenuAction::Exec("grim -g \"$(slurp)\" - | swappy -f -"),
             ),
         ],
         launcher,
@@ -1483,13 +3884,10 @@ fn build_menubar(
         None,
         false,
         &[
-            ("Home", MenuAction::Exec("nautilus ~")),
-            ("Documents", MenuAction::Exec("nautilus ~/Documents")),
-            ("Downloads", MenuAction::Exec("nautilus ~/Downloads")),
-            (
-                "MARCH SCARA Repo",
-                MenuAction::Exec("nautilus ~/march-scara"),
-            ),
+            ("Home", MenuAction::Exec("thunar ~")),
+            ("Documents", MenuAction::Exec("thunar ~/Documents")),
+            ("Downloads", MenuAction::Exec("thunar ~/Downloads")),
+            ("MARCH SCARA Repo", MenuAction::Exec("thunar ~/march-scara")),
         ],
         launcher,
         launcher_search,
@@ -1535,7 +3933,11 @@ fn build_menubar(
     row.append(&spacer);
 
     // 3. Tray Kanan: Bluetooth, Battery, Wi-Fi, Spotlight, Control Center, Clock
-    row.append(&build_bluetooth_button());
+    let bluetooth_button = build_bluetooth_button();
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("bluetooth".to_string(), bluetooth_button.clone().upcast());
+    row.append(&bluetooth_button);
 
     let (bat_pct, bat_stat) = read_battery_info();
     let bat_box = GtkBox::new(Orientation::Horizontal, 4);
@@ -1557,34 +3959,59 @@ fn build_menubar(
     let bat_info_lbl = Label::new(Some(&format!("Battery: {} ({})", bat_pct, bat_stat)));
     bat_pop.set_child(Some(&bat_info_lbl));
     bat_btn.set_popover(Some(&bat_pop));
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("battery".to_string(), bat_btn.clone().upcast());
     row.append(&bat_btn);
 
-    row.append(&build_wifi_button());
-    row.append(&build_spotlight_button());
+    let wifi_button = build_wifi_button();
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("wifi".to_string(), wifi_button.clone().upcast());
+    row.append(&wifi_button);
+
+    let spotlight_button = build_spotlight_button();
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("spotlight".to_string(), spotlight_button.clone().upcast());
+    row.append(&spotlight_button);
 
     let cc_btn = MenuButton::new();
     cc_btn.add_css_class("flat");
     cc_btn.add_css_class("menubar-item");
     cc_btn.set_child(Some(&build_cc_toggle_icon()));
-    cc_btn.set_popover(Some(&build_control_center_popover(settings)));
+    cc_btn.set_popover(Some(&build_control_center_popover(
+        settings,
+        menu_bar_widgets,
+    )));
     cc_btn.set_tooltip_text(Some("Control Center"));
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("control_center".to_string(), cc_btn.clone().upcast());
     row.append(&cc_btn);
 
-    let clock_lbl = Label::new(Some(&format_tahoe_clock()));
+    let clock_lbl = Label::new(Some(&format_tahoe_clock(
+        preferences.borrow().clock_24_hour,
+    )));
     clock_lbl.add_css_class("menubar-clock");
+    menu_bar_widgets
+        .borrow_mut()
+        .insert("clock".to_string(), clock_lbl.clone().upcast());
     row.append(&clock_lbl);
 
     let clock_ref = clock_lbl.clone();
     let bat_ref = bat_lbl.clone();
     let bat_info_ref = bat_info_lbl.clone();
+    let preferences_ref = preferences.clone();
     glib::timeout_add_seconds_local(5, move || {
-        clock_ref.set_text(&format_tahoe_clock());
+        clock_ref.set_text(&format_tahoe_clock(preferences_ref.borrow().clock_24_hour));
         let (pct, stat) = read_battery_info();
         bat_ref.set_text(&pct);
         bat_info_ref.set_text(&format!("Battery: {} ({})", pct, stat));
         glib::ControlFlow::Continue
     });
 
+    set_menu_bar_module_visibility(menu_bar_widgets, &preferences.borrow());
     bar_win.set_child(Some(&row));
     bar_win.present();
 }
@@ -1672,14 +4099,14 @@ fn build_dock(
     let apps: &[(&str, &[&str], &str, bool)] = &[
         (
             "Finder",
-            &["system-file-manager", "org.gnome.Nautilus"],
-            "nautilus",
+            &["system-file-manager", "org.xfce.thunar"],
+            "thunar",
             true,
         ),
         (
             "Launchpad",
             &["applications-all", "view-app-grid-symbolic"],
-            "nautilus /usr/share/applications",
+            "thunar /usr/share/applications",
             false,
         ),
         (
@@ -1703,6 +4130,24 @@ fn build_dock(
                 "accessories-text-editor",
             ],
             "gnome-text-editor",
+            false,
+        ),
+        (
+            "Calendar",
+            &["x-office-calendar", "org.gnome.Calendar"],
+            "gnome-calendar",
+            false,
+        ),
+        (
+            "Videos",
+            &["mpv", "video-x-generic", "multimedia-player"],
+            "mpv --idle=yes --force-window=yes",
+            false,
+        ),
+        (
+            "Calculator",
+            &["accessories-calculator", "org.gnome.Calculator"],
+            "gnome-calculator",
             false,
         ),
         (
@@ -1732,7 +4177,7 @@ fn build_dock(
     dock_box.append(&make_dock_item(
         "Documents",
         &["folder-documents", "folder"],
-        "nautilus ~/Documents",
+        "thunar ~/Documents",
         false,
         launcher,
         launcher_search,
@@ -1741,7 +4186,7 @@ fn build_dock(
     dock_box.append(&make_dock_item(
         "Downloads",
         &["folder-download", "folder"],
-        "nautilus ~/Downloads",
+        "thunar ~/Downloads",
         false,
         launcher,
         launcher_search,
@@ -1750,7 +4195,7 @@ fn build_dock(
     dock_box.append(&make_dock_item(
         "Trash",
         &["user-trash-full", "user-trash"],
-        "nautilus trash:///",
+        "thunar trash:///",
         false,
         launcher,
         launcher_search,
@@ -1765,9 +4210,12 @@ fn build_dock(
 fn main() -> glib::ExitCode {
     let app = Application::builder()
         .application_id("org.marchscara.Shell")
+        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
+    let settings_navigator = Rc::new(RefCell::new(None::<SettingsNavigator>));
 
-    app.connect_activate(|app| {
+    let settings_navigator_ref = settings_navigator.clone();
+    app.connect_activate(move |app| {
         apply_tahoe_icon_theme();
 
         let provider = CssProvider::new();
@@ -1780,10 +4228,31 @@ fn main() -> glib::ExitCode {
             );
         }
 
-        build_wallpaper(app);
-        let settings_window = build_settings_window(app);
-        let (launcher_window, launcher_search) = build_app_launcher(app, &settings_window);
-        build_menubar(app, &launcher_window, &launcher_search, &settings_window);
+        let wallpaper_picture = build_wallpaper(app);
+        let (initial_preferences, preferences_error) = match preferences::load() {
+            Ok(preferences) => (preferences, None),
+            Err(error) => (UserPreferences::default(), Some(error.to_string())),
+        };
+        let preferences = Rc::new(RefCell::new(initial_preferences));
+        let menu_bar_widgets = Rc::new(RefCell::new(std::collections::HashMap::new()));
+        let (settings_window, navigator) = build_settings_window(
+            app,
+            &wallpaper_picture,
+            preferences.clone(),
+            preferences_error,
+            menu_bar_widgets.clone(),
+        );
+        *settings_navigator_ref.borrow_mut() = Some(navigator.clone());
+        let (launcher_window, launcher_search) =
+            build_app_launcher(app, &settings_window, &navigator);
+        build_menubar(
+            app,
+            &launcher_window,
+            &launcher_search,
+            &settings_window,
+            &preferences,
+            &menu_bar_widgets,
+        );
         build_dock(app, &launcher_window, &launcher_search, &settings_window);
 
         let shell_commands = start_shell_ipc();
@@ -1802,6 +4271,27 @@ fn main() -> glib::ExitCode {
             }
             glib::ControlFlow::Continue
         });
+    });
+
+    let settings_navigator_ref = settings_navigator.clone();
+    app.connect_open(move |application, files, _hint| {
+        let target = files.iter().find_map(|file| {
+            let uri = file.uri();
+            settings_panel_from_uri(uri.as_str())
+        });
+        let Some(target) = target else {
+            eprintln!("No supported MARCH SCARA Settings deep link was provided.");
+            return;
+        };
+
+        if settings_navigator_ref.borrow().is_none() {
+            application.activate();
+        }
+        if let Some(navigate) = settings_navigator_ref.borrow().as_ref() {
+            navigate(target);
+        } else {
+            eprintln!("MARCH SCARA Settings did not initialize.");
+        }
     });
 
     app.run()

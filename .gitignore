@@ -10,6 +10,7 @@
 
 # Local nested checkout
 /march-scara/
+/TODO.md
 
 # Local-only files
 .env

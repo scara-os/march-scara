@@ -82,15 +82,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let trimmed = cmd.trim();
                 let reply = match trimmed {
                     "ping" => "PONG | MARCH SCARA Wayland Compositor Active".to_string(),
-                    "reload" => { let _ = ipc_tx.send("config:reload".to_string()); "OK: Reloaded init.lua".to_string() }
+                    "reload" => {
+                        let _ = ipc_tx.send("config:reload".to_string());
+                        "OK: Reloaded init.lua".to_string()
+                    }
                     "config" => format!("{:?}", cfg_for_ipc.lock().unwrap()),
-                    action if action.starts_with("window:")
-                        || action.starts_with("exec:")
-                        || action.starts_with("layout:")
-                        || action.starts_with("workspace:")
-                        || action.starts_with("movetoworkspace:")
-                        || action == "config:reload"
-                        || action == "session:quit" =>
+                    action
+                        if action.starts_with("window:")
+                            || action.starts_with("exec:")
+                            || action.starts_with("layout:")
+                            || action.starts_with("workspace:")
+                            || action.starts_with("movetoworkspace:")
+                            || action == "config:reload"
+                            || action == "session:quit" =>
                     {
                         let _ = ipc_tx.send(action.to_string());
                         format!("OK: {}", action)
@@ -130,12 +134,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("WAYLAND_DISPLAY", &data.state.socket_name);
     update_dbus_activation_environment();
 
-    // Jalankan komponen DE (scara-daemon, scara-shell dengan GSK_RENDERER=gl, dan kitty)
+    // Start the shell's required session services and applications.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
     let mut children = Vec::new();
+    match std::process::Command::new("mako").spawn() {
+        Ok(notification_daemon) => children.push(notification_daemon),
+        Err(error) => warn!(%error, "Failed to start the Mako notification daemon"),
+    }
+    match std::process::Command::new("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
+        .spawn()
+    {
+        Ok(authentication_agent) => children.push(authentication_agent),
+        Err(error) => warn!(%error, "Failed to start the Polkit authentication agent"),
+    }
+
     if let Some(dir) = exe_dir {
         if let Ok(daemon) = std::process::Command::new(dir.join("scara-daemon")).spawn() {
             children.push(daemon);

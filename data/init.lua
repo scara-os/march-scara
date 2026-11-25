@@ -9,7 +9,7 @@ scara.setup({
 })
 
 scara.bind("SUPER+Return",   "exec:kitty")
-scara.bind("SUPER+E",        "exec:nautilus")
+scara.bind("SUPER+E",        "exec:thunar")
 scara.bind("SUPER+Q",        "window:close")
 scara.bind("SUPER+F",        "window:toggle_floating")
 scara.bind("SUPER+Left",     "window:tile_left")

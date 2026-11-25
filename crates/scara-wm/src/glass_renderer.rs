@@ -204,7 +204,12 @@ impl GlassPipeline {
                 }
                 if let Some(geo) = map.layer_geometry(layer) {
                     let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = layer
-                        .render_elements(renderer, geo.loc.to_physical_precise_round(1.0), scale, 1.0);
+                        .render_elements(
+                            renderer,
+                            geo.loc.to_physical_precise_round(1.0),
+                            scale,
+                            1.0,
+                        );
                     backdrop.extend(elems);
                 }
             }
@@ -430,11 +435,7 @@ impl GlassPipeline {
         final_elems.extend(overlay_elems);
         final_elems.extend(top_elems);
         final_elems.extend(glass_elems);
-        final_elems.extend(
-            backdrop_final
-                .into_iter()
-                .map(ScaraRenderElements::Wayland),
-        );
+        final_elems.extend(backdrop_final.into_iter().map(ScaraRenderElements::Wayland));
 
         damage_tracker.render_output(
             renderer,

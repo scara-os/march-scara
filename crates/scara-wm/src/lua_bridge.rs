@@ -32,10 +32,18 @@ pub fn load_user_config(path: &str) -> LuaResult<Arc<Mutex<ScaraConfig>>> {
         let cfg_ref = Arc::clone(&cfg);
         let setup_fn = lua.create_function(move |_, opts: LuaTable| {
             let mut c = cfg_ref.lock().unwrap();
-            if let Ok(r) = opts.get::<f32>("rounding") { c.rounding = r; }
-            if let Ok(g) = opts.get::<f32>("glass_refraction") { c.glass_refraction = g; }
-            if let Ok(b) = opts.get::<u32>("blur_passes") { c.blur_passes = b; }
-            if let Ok(l) = opts.get::<String>("layout") { c.default_layout = l; }
+            if let Ok(r) = opts.get::<f32>("rounding") {
+                c.rounding = r;
+            }
+            if let Ok(g) = opts.get::<f32>("glass_refraction") {
+                c.glass_refraction = g;
+            }
+            if let Ok(b) = opts.get::<u32>("blur_passes") {
+                c.blur_passes = b;
+            }
+            if let Ok(l) = opts.get::<String>("layout") {
+                c.default_layout = l;
+            }
             Ok(())
         })?;
         scara_tbl.set("setup", setup_fn)?;

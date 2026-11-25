@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 gtk = { version = "0.11", package = "gtk4", features = ["v4_8"] }
 gtk-layer-shell = { version = "0.8.1", package = "gtk4-layer-shell" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
