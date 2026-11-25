@@ -1,12 +1,19 @@
 use gtk::prelude::*;
 use gtk::{
     glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, ContentFit, CssProvider,
-    IconTheme, Image, Label, MenuButton, Orientation, Picture, Popover, Scale, ScrolledWindow,
-    SearchEntry, Separator,
+    Grid, IconTheme, Image, Label, MenuButton, Orientation, Picture, Popover, Scale,
+    ScrolledWindow, SearchEntry, Separator, Stack, StackSidebar, Switch,
 };
 use gtk_layer_shell::{Edge, Layer, LayerShell};
-use std::path::PathBuf;
-use std::process::Command;
+use std::{
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    path::PathBuf,
+    process::Command,
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Duration,
+};
 
 const TAHOE_CSS: &str = r#"
 window,
@@ -18,6 +25,16 @@ window.transparent-layer.background {
     border: none;
     box-shadow: none;
     font-family: "SF Pro Text", "Inter", sans-serif;
+}
+
+window.settings-window,
+window.apps-launcher {
+    background-color: #202127;
+    color: #f5f5f7;
+}
+
+.settings-sidebar {
+    background-color: rgba(255, 255, 255, 0.06);
 }
 
 .tahoe-wallpaper-fallback {
@@ -202,6 +219,10 @@ fn launch_app(cmd: &str) {
     let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
 }
 
+fn launch_program(program: &str, args: &[&str]) -> Result<(), std::io::Error> {
+    Command::new(program).args(args).spawn().map(|_| ())
+}
+
 fn send_wm_ipc(action: &str) {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -210,6 +231,60 @@ fn send_wm_ipc(action: &str) {
         }
     }
     let _ = Command::new("scara-ctl").arg(action).spawn();
+}
+
+fn show_launcher(window: &ApplicationWindow, search: &SearchEntry) {
+    window.present();
+    search.set_text("");
+    search.grab_focus();
+    send_wm_ipc("window:focus-launcher");
+}
+
+fn start_shell_ipc() -> Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let socket_path = PathBuf::from(runtime_dir).join("scara-shell.sock");
+
+    if let Ok(mut stream) = UnixStream::connect(&socket_path) {
+        let _ = stream.write_all(b"launcher");
+        return receiver;
+    }
+
+    if let Err(error) = std::fs::remove_file(&socket_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("Could not remove stale shell socket: {error}");
+            return receiver;
+        }
+    }
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Could not create shell IPC socket: {error}");
+            return receiver;
+        }
+    };
+
+    thread::spawn(move || {
+        for connection in listener.incoming() {
+            let Ok(mut stream) = connection else {
+                eprintln!("Error accepting shell IPC connection");
+                continue;
+            };
+            let mut command = String::new();
+            match stream.read_to_string(&mut command) {
+                Ok(_) => {
+                    if sender.send(command).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => eprintln!("Error reading shell IPC command: {error}"),
+            }
+        }
+        let _ = std::fs::remove_file(socket_path);
+    });
+
+    receiver
 }
 
 fn run_cmd_output(cmd: &str) -> String {
@@ -278,7 +353,11 @@ fn load_desktop_apps() -> Vec<DesktopApp> {
 
                     if !no_display {
                         if let (Some(n), Some(e)) = (name, exec) {
-                            apps.push(DesktopApp { name: n, exec: e, icon });
+                            apps.push(DesktopApp {
+                                name: n,
+                                exec: e,
+                                icon,
+                            });
                         }
                     }
                 }
@@ -297,7 +376,10 @@ fn find_wallpaper_path() -> Option<PathBuf> {
         format!("{}/.config/march-scara/wallpaper.png", home),
         format!("{}/.config/march-scara/wallpaper.webp", home),
     ];
-    candidates.into_iter().map(PathBuf::from).find(|p| p.exists())
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
 }
 
 fn apply_tahoe_icon_theme() {
@@ -369,9 +451,502 @@ fn build_wallpaper(app: &Application) {
     bg_win.present();
 }
 
+fn build_app_launcher(
+    app: &Application,
+    settings_window: &ApplicationWindow,
+) -> (ApplicationWindow, SearchEntry) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("Applications")
+        .default_width(760)
+        .default_height(620)
+        .build();
+    window.set_hide_on_close(true);
+    window.add_css_class("apps-launcher");
+
+    let root = GtkBox::new(Orientation::Vertical, 12);
+    root.set_margin_top(20);
+    root.set_margin_bottom(20);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let search = SearchEntry::new();
+    search.set_placeholder_text(Some("Search applications"));
+    root.append(&search);
+
+    let grid = Grid::new();
+    grid.set_row_spacing(12);
+    grid.set_column_spacing(12);
+    grid.set_column_homogeneous(true);
+
+    let scroll = ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&grid)
+        .build();
+    root.append(&scroll);
+    window.set_child(Some(&root));
+
+    let mut apps = load_desktop_apps();
+    apps.push(DesktopApp {
+        name: "MARCH SCARA Settings".into(),
+        exec: "__scara_settings__".into(),
+        icon: "preferences-system-symbolic".into(),
+    });
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let populate = {
+        let grid = grid.clone();
+        let apps = apps.clone();
+        let window = window.clone();
+        let settings_window = settings_window.clone();
+        move |query: &str| {
+            while let Some(child) = grid.first_child() {
+                grid.remove(&child);
+            }
+
+            let query = query.trim().to_lowercase();
+            let mut column = 0;
+            let mut row = 0;
+            for app in apps.iter().filter(|app| {
+                query.is_empty()
+                    || app.name.to_lowercase().contains(&query)
+                    || app.exec.to_lowercase().contains(&query)
+            }) {
+                let icon = Image::from_icon_name(&app.icon);
+                icon.set_pixel_size(40);
+                let label = Label::new(Some(&app.name));
+                label.set_wrap(true);
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                label.set_max_width_chars(18);
+
+                let content = GtkBox::new(Orientation::Vertical, 8);
+                content.set_halign(Align::Center);
+                content.append(&icon);
+                content.append(&label);
+
+                let button = Button::builder().child(&content).build();
+                button.add_css_class("flat");
+                button.add_css_class("menu-action-btn");
+                button.set_size_request(118, 100);
+
+                let exec = app.exec.clone();
+                let window = window.clone();
+                let settings_window = settings_window.clone();
+                button.connect_clicked(move |_| {
+                    window.set_visible(false);
+                    if exec == "__scara_settings__" {
+                        settings_window.present();
+                    } else {
+                        launch_app(&exec);
+                    }
+                });
+                grid.attach(&button, column, row, 1, 1);
+                column += 1;
+                if column == 5 {
+                    column = 0;
+                    row += 1;
+                }
+            }
+        }
+    };
+
+    populate("");
+    let populate_search = populate.clone();
+    search.connect_search_changed(move |entry| populate_search(&entry.text()));
+
+    let apps_for_enter = apps;
+    let window_for_enter = window.clone();
+    let settings_for_enter = settings_window.clone();
+    search.connect_activate(move |entry| {
+        let query = entry.text().trim().to_lowercase();
+        if let Some(app) = apps_for_enter.iter().find(|app| {
+            query.is_empty()
+                || app.name.to_lowercase().contains(&query)
+                || app.exec.to_lowercase().contains(&query)
+        }) {
+            window_for_enter.set_visible(false);
+            if app.exec == "__scara_settings__" {
+                settings_for_enter.present();
+            } else {
+                launch_app(&app.exec);
+            }
+        }
+    });
+
+    (window, search)
+}
+
+fn settings_page(title: &str, description: &str) -> GtkBox {
+    let page = GtkBox::new(Orientation::Vertical, 14);
+    page.set_margin_top(28);
+    page.set_margin_bottom(24);
+    page.set_margin_start(28);
+    page.set_margin_end(28);
+
+    let heading = Label::new(Some(title));
+    heading.add_css_class("cc-title");
+    heading.set_halign(Align::Start);
+    page.append(&heading);
+
+    let detail = Label::new(Some(description));
+    detail.add_css_class("cc-sub");
+    detail.set_halign(Align::Start);
+    detail.set_wrap(true);
+    page.append(&detail);
+    page
+}
+
+fn settings_card(title: &str, description: &str) -> GtkBox {
+    let card = GtkBox::new(Orientation::Vertical, 8);
+    card.add_css_class("cc-card");
+
+    let heading = Label::new(Some(title));
+    heading.add_css_class("cc-title");
+    heading.set_halign(Align::Start);
+
+    let detail = Label::new(Some(description));
+    detail.add_css_class("cc-sub");
+    detail.set_halign(Align::Start);
+    detail.set_wrap(true);
+
+    card.append(&heading);
+    card.append(&detail);
+    card
+}
+
+fn add_settings_tool(
+    page: &GtkBox,
+    label: &str,
+    program: &'static str,
+    args: &'static [&'static str],
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    let button = Button::with_label(label);
+    button.add_css_class("flat");
+    button.add_css_class("menu-action-btn");
+    let status = Label::new(None);
+    status.add_css_class("cc-sub");
+    status.set_halign(Align::Start);
+    let status_ref = status.clone();
+    button.connect_clicked(move |_| match launch_program(program, args) {
+        Ok(()) => status_ref.set_text("Opened system utility."),
+        Err(error) => status_ref.set_text(&format!("{program} is unavailable: {error}")),
+    });
+    row.append(&button);
+    row.append(&status);
+    page.append(&row);
+}
+
+fn build_settings_window(app: &Application) -> ApplicationWindow {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("MARCH SCARA Settings")
+        .default_width(980)
+        .default_height(680)
+        .build();
+    window.add_css_class("settings-window");
+
+    let layout = GtkBox::new(Orientation::Horizontal, 0);
+    let stack = Stack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+
+    let sidebar = StackSidebar::new();
+    sidebar.set_stack(&stack);
+    sidebar.set_size_request(220, -1);
+    sidebar.add_css_class("settings-sidebar");
+    layout.append(&sidebar);
+    layout.append(&stack);
+
+    let page_specs = [
+        (
+            "wifi",
+            "Wi-Fi",
+            "Manage wireless connections and radio state.",
+        ),
+        (
+            "bluetooth",
+            "Bluetooth",
+            "Manage Bluetooth power and connected devices.",
+        ),
+        (
+            "display",
+            "Displays",
+            "Configure resolution, orientation, and monitor layout.",
+        ),
+        (
+            "appearance",
+            "Appearance",
+            "Adjust desktop colors, icons, and wallpaper.",
+        ),
+        (
+            "network",
+            "Network",
+            "Review network connections and wired settings.",
+        ),
+        (
+            "sound",
+            "Sound",
+            "Control output volume and open the audio mixer.",
+        ),
+        (
+            "power",
+            "Power",
+            "Review battery status and power-management tools.",
+        ),
+        (
+            "multitasking",
+            "Multitasking",
+            "Configure workspaces, tiling, and window behavior.",
+        ),
+        (
+            "apps",
+            "Apps & Defaults",
+            "Browse applications and manage default apps.",
+        ),
+        (
+            "notifications",
+            "Notifications",
+            "Configure notification behavior.",
+        ),
+        (
+            "search",
+            "App Search",
+            "Search and launch installed desktop applications.",
+        ),
+        (
+            "mouse",
+            "Mouse & Touchpad",
+            "Pointer speed, scrolling, and touchpad click behavior.",
+        ),
+        (
+            "keyboard",
+            "Keyboard & Shortcuts",
+            "Review keyboard layout and MARCH SCARA shortcuts.",
+        ),
+        (
+            "accessibility",
+            "Accessibility",
+            "Accessibility options and assistive technologies.",
+        ),
+        (
+            "privacy",
+            "Privacy & Encryption",
+            "Privacy controls, screen lock, and encryption status.",
+        ),
+        ("system", "System", "System information and session tools."),
+    ];
+
+    for (id, title, description) in page_specs {
+        let page = settings_page(title, description);
+        match id {
+            "wifi" => {
+                let card = settings_card("Wireless", "Toggle Wi-Fi using NetworkManager.");
+                let controls = GtkBox::new(Orientation::Horizontal, 10);
+                let status = Label::new(Some(&format!(
+                    "Wi-Fi radio: {}",
+                    run_cmd_output("nmcli radio wifi")
+                )));
+                status.add_css_class("cc-sub");
+                let toggle = Switch::new();
+                toggle.set_active(run_cmd_output("nmcli radio wifi") == "enabled");
+                let status_ref = status.clone();
+                toggle.connect_active_notify(move |switch| {
+                    let action = if switch.is_active() { "on" } else { "off" };
+                    launch_app(&format!("nmcli radio wifi {action}"));
+                    status_ref.set_text(&format!("Wi-Fi radio: {}", action));
+                });
+                controls.append(&status);
+                controls.append(&toggle);
+                card.append(&controls);
+                page.append(&card);
+                add_settings_tool(&page, "Open connection editor", "nm-connection-editor", &[]);
+            }
+            "bluetooth" => {
+                let card =
+                    settings_card("Bluetooth radio", "Power the Bluetooth adapter on or off.");
+                let controls = GtkBox::new(Orientation::Horizontal, 10);
+                let powered =
+                    run_cmd_output("bluetoothctl show | grep 'Powered:' | awk '{print $2}'");
+                let status = Label::new(Some(if powered == "yes" {
+                    "Bluetooth is on"
+                } else {
+                    "Bluetooth is off"
+                }));
+                status.add_css_class("cc-sub");
+                let toggle = Switch::new();
+                toggle.set_active(powered == "yes");
+                let status_ref = status.clone();
+                toggle.connect_active_notify(move |switch| {
+                    let action = if switch.is_active() { "on" } else { "off" };
+                    launch_app(&format!("bluetoothctl power {action}"));
+                    status_ref.set_text(if switch.is_active() {
+                        "Bluetooth is on"
+                    } else {
+                        "Bluetooth is off"
+                    });
+                });
+                controls.append(&status);
+                controls.append(&toggle);
+                card.append(&controls);
+                page.append(&card);
+                add_settings_tool(&page, "Open Bluetooth manager", "blueman-manager", &[]);
+            }
+            "sound" => {
+                let card = settings_card("Output volume", "Adjust the default audio output.");
+                let slider = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+                if let Ok(volume) = run_cmd_output("pamixer --get-volume").parse::<f64>() {
+                    slider.set_value(volume);
+                }
+                slider.connect_value_changed(|scale| {
+                    launch_app(&format!(
+                        "pamixer --set-volume {}",
+                        scale.value().round() as u32
+                    ));
+                });
+                card.append(&slider);
+                page.append(&card);
+                add_settings_tool(&page, "Open audio mixer", "pavucontrol", &[]);
+            }
+            "power" => {
+                let (capacity, state) = read_battery_info();
+                page.append(&settings_card(
+                    "Battery",
+                    &format!("Charge: {capacity} · State: {state}"),
+                ));
+                add_settings_tool(
+                    &page,
+                    "Open power settings",
+                    "gnome-control-center",
+                    &["power"],
+                );
+            }
+            "apps" | "search" => {
+                let card = settings_card(
+                    "Installed applications",
+                    "Use the MARCH SCARA application grid to search and launch desktop apps.",
+                );
+                let button = Button::with_label("Open application grid");
+                button.add_css_class("flat");
+                button.add_css_class("menu-action-btn");
+                let app = app.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(window) = app
+                        .windows()
+                        .into_iter()
+                        .find(|window| window.title().as_deref() == Some("Applications"))
+                    {
+                        window.present();
+                    }
+                });
+                card.append(&button);
+                page.append(&card);
+                add_settings_tool(
+                    &page,
+                    "Default application settings",
+                    "gnome-control-center",
+                    &["applications"],
+                );
+            }
+            "keyboard" => {
+                let card = settings_card(
+                    "MARCH SCARA shortcuts",
+                    "Super+Return: terminal · Super+E: files · Super+Q: close · Super+1–5: workspaces · Super alone: app launcher.",
+                );
+                page.append(&card);
+                add_settings_tool(
+                    &page,
+                    "Open keyboard settings",
+                    "gnome-control-center",
+                    &["keyboard"],
+                );
+            }
+            "mouse" => {
+                page.append(&settings_card(
+                    "Touchpad",
+                    "Tap-to-click is enabled by MARCH SCARA when supported by the device. Pointer settings are applied by libinput.",
+                ));
+                add_settings_tool(
+                    &page,
+                    "Open mouse settings",
+                    "gnome-control-center",
+                    &["mouse"],
+                );
+            }
+            "multitasking" => {
+                page.append(&settings_card(
+                    "Workspaces and windows",
+                    "Use Super+1–5 to switch workspaces, Super+Shift+1–5 to move a window, Super+F to toggle floating, and Super+T to toggle layout.",
+                ));
+            }
+            "display" => add_settings_tool(&page, "Open display controls", "wdisplays", &[]),
+            "appearance" => add_settings_tool(
+                &page,
+                "Open appearance settings",
+                "gnome-control-center",
+                &["appearance"],
+            ),
+            "network" => add_settings_tool(
+                &page,
+                "Open network connections",
+                "nm-connection-editor",
+                &[],
+            ),
+            "notifications" => add_settings_tool(
+                &page,
+                "Open notification settings",
+                "gnome-control-center",
+                &["notifications"],
+            ),
+            "accessibility" => add_settings_tool(
+                &page,
+                "Open accessibility settings",
+                "gnome-control-center",
+                &["universal-access"],
+            ),
+            "privacy" => {
+                page.append(&settings_card(
+                    "Privacy and encryption",
+                    "MARCH SCARA does not yet change encryption, lock-screen, or system privacy policy. Use your system's trusted security tools for these controls.",
+                ));
+                add_settings_tool(
+                    &page,
+                    "Open privacy settings",
+                    "gnome-control-center",
+                    &["privacy"],
+                );
+            }
+            "system" => {
+                page.append(&settings_card(
+                    "MARCH SCARA",
+                    "Standalone Wayland session using DRM/KMS, libinput, and Smithay.",
+                ));
+                add_settings_tool(
+                    &page,
+                    "Open system information",
+                    "gnome-control-center",
+                    &["about"],
+                );
+            }
+            _ => page.append(&settings_card(
+                "Settings integration",
+                "This settings section is not connected to a system control yet.",
+            )),
+        }
+        stack.add_titled(&page, Some(id), title);
+    }
+
+    window.set_child(Some(&layout));
+    window
+}
+
 enum MenuAction {
     Exec(&'static str),
     Ipc(&'static str),
+    Apps,
+    Settings,
     Separator,
 }
 
@@ -380,6 +955,9 @@ fn make_dropdown_menu(
     icon: Option<&str>,
     bold: bool,
     items: &[(&str, MenuAction)],
+    launcher: &ApplicationWindow,
+    launcher_search: &SearchEntry,
+    settings: &ApplicationWindow,
 ) -> MenuButton {
     let mb = MenuButton::new();
     mb.add_css_class("flat");
@@ -445,6 +1023,30 @@ fn make_dropdown_menu(
                 });
                 box_col.append(&b);
             }
+            MenuAction::Apps | MenuAction::Settings => {
+                let b = Button::with_label(title);
+                b.add_css_class("flat");
+                b.add_css_class("menu-action-btn");
+                if let Some(lbl) = b.child().and_then(|c| c.downcast::<Label>().ok()) {
+                    lbl.set_halign(Align::Start);
+                }
+                let pop_ref = pop.clone();
+                if matches!(action, MenuAction::Apps) {
+                    let launcher = launcher.clone();
+                    let search = launcher_search.clone();
+                    b.connect_clicked(move |_| {
+                        pop_ref.popdown();
+                        show_launcher(&launcher, &search);
+                    });
+                } else {
+                    let settings = settings.clone();
+                    b.connect_clicked(move |_| {
+                        pop_ref.popdown();
+                        settings.present();
+                    });
+                }
+                box_col.append(&b);
+            }
         }
     }
 
@@ -503,7 +1105,8 @@ fn build_wifi_button() -> MenuButton {
     let list_ref = list_box.clone();
     let pop_ref = pop.clone();
     pop.connect_show(move |_| {
-        let active = run_cmd_output("nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2");
+        let active =
+            run_cmd_output("nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d: -f2");
         if active.is_empty() {
             status_ref.set_text("Not Connected");
         } else {
@@ -694,7 +1297,7 @@ fn build_spotlight_button() -> MenuButton {
     mb
 }
 
-fn build_control_center_popover() -> Popover {
+fn build_control_center_popover(settings: &ApplicationWindow) -> Popover {
     let popover = Popover::new();
     popover.set_has_arrow(false);
     popover.set_offset(0, 4);
@@ -739,9 +1342,10 @@ fn build_control_center_popover() -> Popover {
     settings_btn.add_css_class("flat");
     settings_btn.add_css_class("menu-action-btn");
     let pop_ref = popover.clone();
+    let settings = settings.clone();
     settings_btn.connect_clicked(move |_| {
         pop_ref.popdown();
-        launch_app("gnome-control-center");
+        settings.present();
     });
     root.append(&settings_btn);
 
@@ -765,7 +1369,12 @@ fn build_cc_toggle_icon() -> GtkBox {
     col
 }
 
-fn build_menubar(app: &Application) {
+fn build_menubar(
+    app: &Application,
+    launcher: &ApplicationWindow,
+    launcher_search: &SearchEntry,
+    settings: &ApplicationWindow,
+) {
     let bar_win = ApplicationWindow::builder()
         .application(app)
         .title("scara-menubar")
@@ -791,13 +1400,19 @@ fn build_menubar(app: &Application) {
         Some("start-here-symbolic"),
         false,
         &[
-            ("About MARCH SCARA", MenuAction::Exec("notify-send 'MARCH SCARA' 'Wayland Desktop Environment v0.1'")),
+            (
+                "About MARCH SCARA",
+                MenuAction::Exec("notify-send 'MARCH SCARA' 'Wayland Desktop Environment v0.1'"),
+            ),
             ("---", MenuAction::Separator),
-            ("System Settings...", MenuAction::Exec("gnome-control-center")),
+            ("System Settings...", MenuAction::Settings),
             ("Open Terminal", MenuAction::Exec("kitty")),
             ("---", MenuAction::Separator),
             ("Quit MARCH SCARA", MenuAction::Ipc("session:quit")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     // 2. Menu Bar Interaktif ala macOS Tahoe
@@ -807,9 +1422,12 @@ fn build_menubar(app: &Application) {
         true,
         &[
             ("Home Folder", MenuAction::Exec("nautilus ~")),
-            ("Applications", MenuAction::Exec("nautilus /usr/share/applications")),
+            ("Applications", MenuAction::Apps),
             ("Trash", MenuAction::Exec("nautilus trash:///")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -823,6 +1441,9 @@ fn build_menubar(app: &Application) {
             ("---", MenuAction::Separator),
             ("Close Active Window", MenuAction::Ipc("window:close")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -831,8 +1452,14 @@ fn build_menubar(app: &Application) {
         false,
         &[
             ("Copy (Clipboard)", MenuAction::Exec("wl-copy")),
-            ("Take Screenshot", MenuAction::Exec("grim -g \"$(slurp)\" - | wl-copy")),
+            (
+                "Take Screenshot",
+                MenuAction::Exec("grim -g \"$(slurp)\" - | wl-copy"),
+            ),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -840,9 +1467,15 @@ fn build_menubar(app: &Application) {
         None,
         false,
         &[
-            ("Toggle Full / Floating", MenuAction::Ipc("window:toggle_floating")),
+            (
+                "Toggle Full / Floating",
+                MenuAction::Ipc("window:toggle_floating"),
+            ),
             ("Center Window", MenuAction::Ipc("window:center")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -853,8 +1486,14 @@ fn build_menubar(app: &Application) {
             ("Home", MenuAction::Exec("nautilus ~")),
             ("Documents", MenuAction::Exec("nautilus ~/Documents")),
             ("Downloads", MenuAction::Exec("nautilus ~/Downloads")),
-            ("MARCH SCARA Repo", MenuAction::Exec("nautilus ~/march-scara")),
+            (
+                "MARCH SCARA Repo",
+                MenuAction::Exec("nautilus ~/march-scara"),
+            ),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -869,6 +1508,9 @@ fn build_menubar(app: &Application) {
             ("---", MenuAction::Separator),
             ("Close Window", MenuAction::Ipc("window:close")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     row.append(&make_dropdown_menu(
@@ -877,9 +1519,15 @@ fn build_menubar(app: &Application) {
         false,
         &[
             ("Super+Return : Terminal", MenuAction::Exec("kitty")),
-            ("Super+F : Maximize/Float", MenuAction::Ipc("window:toggle_floating")),
+            (
+                "Super+F : Maximize/Float",
+                MenuAction::Ipc("window:toggle_floating"),
+            ),
             ("Super+Q : Close Window", MenuAction::Ipc("window:close")),
         ],
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     let spacer = GtkBox::new(Orientation::Horizontal, 0);
@@ -918,7 +1566,7 @@ fn build_menubar(app: &Application) {
     cc_btn.add_css_class("flat");
     cc_btn.add_css_class("menubar-item");
     cc_btn.set_child(Some(&build_cc_toggle_icon()));
-    cc_btn.set_popover(Some(&build_control_center_popover()));
+    cc_btn.set_popover(Some(&build_control_center_popover(settings)));
     cc_btn.set_tooltip_text(Some("Control Center"));
     row.append(&cc_btn);
 
@@ -941,7 +1589,15 @@ fn build_menubar(app: &Application) {
     bar_win.present();
 }
 
-fn make_dock_item(label: &str, icon_candidates: &[&str], cmd: &str, active: bool) -> GtkBox {
+fn make_dock_item(
+    label: &str,
+    icon_candidates: &[&str],
+    cmd: &str,
+    active: bool,
+    launcher: &ApplicationWindow,
+    launcher_search: &SearchEntry,
+    settings: &ApplicationWindow,
+) -> GtkBox {
     let icon_theme = gtk::gdk::Display::default().map(|d| IconTheme::for_display(&d));
     let chosen_icon = icon_candidates
         .iter()
@@ -958,7 +1614,17 @@ fn make_dock_item(label: &str, icon_candidates: &[&str], cmd: &str, active: bool
     btn.set_tooltip_text(Some(label));
 
     let cmd_owned = cmd.to_string();
-    btn.connect_clicked(move |_| launch_app(&cmd_owned));
+    let launcher = launcher.clone();
+    let launcher_search = launcher_search.clone();
+    let settings = settings.clone();
+    let label_owned = label.to_string();
+    btn.connect_clicked(move |_| match label_owned.as_str() {
+        "Launchpad" => {
+            show_launcher(&launcher, &launcher_search);
+        }
+        "System Settings" => settings.present(),
+        _ => launch_app(&cmd_owned),
+    });
 
     let dot = GtkBox::new(Orientation::Horizontal, 0);
     dot.set_halign(Align::Center);
@@ -975,7 +1641,12 @@ fn make_dock_item(label: &str, icon_candidates: &[&str], cmd: &str, active: bool
     wrapper
 }
 
-fn build_dock(app: &Application) {
+fn build_dock(
+    app: &Application,
+    launcher: &ApplicationWindow,
+    launcher_search: &SearchEntry,
+    settings: &ApplicationWindow,
+) {
     let dock_win = ApplicationWindow::builder()
         .application(app)
         .title("scara-dock")
@@ -999,17 +1670,59 @@ fn build_dock(app: &Application) {
     dock_box.set_halign(Align::Center);
 
     let apps: &[(&str, &[&str], &str, bool)] = &[
-        ("Finder", &["system-file-manager", "org.gnome.Nautilus"], "nautilus", true),
-        ("Launchpad", &["applications-all", "view-app-grid-symbolic"], "nautilus /usr/share/applications", false),
-        ("Browser", &["google-chrome", "firefox", "web-browser"], "google-chrome-stable || firefox", false),
+        (
+            "Finder",
+            &["system-file-manager", "org.gnome.Nautilus"],
+            "nautilus",
+            true,
+        ),
+        (
+            "Launchpad",
+            &["applications-all", "view-app-grid-symbolic"],
+            "nautilus /usr/share/applications",
+            false,
+        ),
+        (
+            "Browser",
+            &["google-chrome", "firefox", "web-browser"],
+            "google-chrome-stable || firefox",
+            false,
+        ),
         ("Terminal", &["kitty", "utilities-terminal"], "kitty", true),
-        ("Editor", &["visual-studio-code", "code", "accessories-text-editor"], "code || gnome-text-editor", false),
-        ("Notes", &["accessories-notes", "org.gnome.TextEditor", "accessories-text-editor"], "gnome-text-editor", false),
-        ("System Settings", &["preferences-system", "org.gnome.Settings"], "gnome-control-center", false),
+        (
+            "Editor",
+            &["visual-studio-code", "code", "accessories-text-editor"],
+            "code || gnome-text-editor",
+            false,
+        ),
+        (
+            "Notes",
+            &[
+                "accessories-notes",
+                "org.gnome.TextEditor",
+                "accessories-text-editor",
+            ],
+            "gnome-text-editor",
+            false,
+        ),
+        (
+            "System Settings",
+            &["preferences-system", "org.gnome.Settings"],
+            "gnome-control-center",
+            false,
+        ),
     ];
 
     for (name, icons, exec_cmd, active) in apps {
-        dock_box.append(&make_dock_item(name, icons, exec_cmd, *active));
+        dock_box.append(&make_dock_item(
+            name,
+            icons,
+            exec_cmd,
+            *active,
+            launcher,
+            launcher_search,
+            settings,
+        ));
     }
 
     let sep = Separator::new(Orientation::Vertical);
@@ -1021,18 +1734,27 @@ fn build_dock(app: &Application) {
         &["folder-documents", "folder"],
         "nautilus ~/Documents",
         false,
+        launcher,
+        launcher_search,
+        settings,
     ));
     dock_box.append(&make_dock_item(
         "Downloads",
         &["folder-download", "folder"],
         "nautilus ~/Downloads",
         false,
+        launcher,
+        launcher_search,
+        settings,
     ));
     dock_box.append(&make_dock_item(
         "Trash",
         &["user-trash-full", "user-trash"],
         "nautilus trash:///",
         false,
+        launcher,
+        launcher_search,
+        settings,
     ));
 
     shadow_pad.append(&dock_box);
@@ -1059,8 +1781,27 @@ fn main() -> glib::ExitCode {
         }
 
         build_wallpaper(app);
-        build_menubar(app);
-        build_dock(app);
+        let settings_window = build_settings_window(app);
+        let (launcher_window, launcher_search) = build_app_launcher(app, &settings_window);
+        build_menubar(app, &launcher_window, &launcher_search, &settings_window);
+        build_dock(app, &launcher_window, &launcher_search, &settings_window);
+
+        let shell_commands = start_shell_ipc();
+        let launcher = launcher_window.clone();
+        let launcher_search = launcher_search.clone();
+        let settings = settings_window.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            for command in shell_commands.try_iter() {
+                match command.trim() {
+                    "launcher" => {
+                        show_launcher(&launcher, &launcher_search);
+                    }
+                    "settings" => settings.present(),
+                    _ => eprintln!("Unknown shell IPC command: {}", command.trim()),
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     });
 
     app.run()

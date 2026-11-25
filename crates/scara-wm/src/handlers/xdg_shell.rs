@@ -1,6 +1,9 @@
 use smithay::{
     delegate_xdg_shell,
-    desktop::{find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, PopupKind, PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, PopupKind,
+        PopupManager, Space, Window, WindowSurfaceType,
+    },
     input::{
         pointer::{Focus, GrabStartData as PointerGrabStartData},
         Seat,
@@ -43,25 +46,24 @@ impl XdgShellHandler for Smallvil {
         if layout == "tiling" {
             self.apply_tiling_layout();
         } else {
-            self.animate_window_to(window, x, y);
+            self.animate_window_to(window.clone(), x, y);
         }
 
-        if self.space.elements().count() == 1 {
-            let focus_surface = {
-                self.space.elements().next().and_then(|window| {
-                    window.set_activated(true);
-                    window
-                        .toplevel()
-                        .map(|toplevel| toplevel.wl_surface().clone())
-                })
-            };
-            if let Some(surface) = focus_surface {
-                self.seat.get_keyboard().unwrap().set_focus(
-                    self,
-                    Some(surface),
-                    SERIAL_COUNTER.next_serial(),
-                );
+        let focus_surface = window
+            .toplevel()
+            .map(|toplevel| toplevel.wl_surface().clone());
+        self.space.elements().for_each(|other| {
+            other.set_activated(other == &window);
+            if let Some(toplevel) = other.toplevel() {
+                toplevel.send_pending_configure();
             }
+        });
+        if let Some(surface) = focus_surface {
+            self.seat.get_keyboard().unwrap().set_focus(
+                self,
+                Some(surface),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
     }
 
@@ -70,7 +72,12 @@ impl XdgShellHandler for Smallvil {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             let geometry = positioner.get_geometry();
             state.geometry = geometry;

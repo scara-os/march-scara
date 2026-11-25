@@ -1,7 +1,7 @@
 # Maintainer: Scara <scara@archlinux>
 pkgname=march-scara-git
 _pkgname=march-scara
-pkgver=0.1.0.r10.g53fdfe1
+pkgver=0.1.0.r11.g7a2f46b
 pkgrel=1
 pkgdesc="macOS Tahoe-styled Desktop Environment with Hyprland freedom and GNOME comfort"
 arch=('x86_64')

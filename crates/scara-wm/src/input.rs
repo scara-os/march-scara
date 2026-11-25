@@ -5,14 +5,19 @@ use smithay::{
     },
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent},
+        pointer::{
+            AxisFrame, ButtonEvent, Focus, GrabStartData as PointerGrabStartData, MotionEvent,
+        },
     },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
+    wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData},
 };
+use std::io::Write;
+use std::os::unix::net::UnixStream;
 use tracing::{info, warn};
 
 use crate::{
@@ -22,10 +27,7 @@ use crate::{
 };
 
 fn matches_keybind(combo: &str, mods: &ModifiersState, sym: Keysym) -> bool {
-    let parts: Vec<String> = combo
-        .split('+')
-        .map(|s| s.trim().to_uppercase())
-        .collect();
+    let parts: Vec<String> = combo.split('+').map(|s| s.trim().to_uppercase()).collect();
     if parts.is_empty() {
         return false;
     }
@@ -115,8 +117,59 @@ impl Smallvil {
 
         if let Some(cmd) = action.strip_prefix("exec:") {
             let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+        } else if action == "shell:launcher" {
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+            match UnixStream::connect(format!("{runtime_dir}/scara-shell.sock")) {
+                Ok(mut stream) => {
+                    if let Err(error) = stream.write_all(b"launcher") {
+                        warn!(%error, "Failed to activate application launcher");
+                    }
+                }
+                Err(error) => warn!(%error, "Could not connect to the MARCH SCARA shell"),
+            }
         } else if action == "session:quit" {
             self.loop_signal.stop();
+        } else if action == "window:focus-launcher" {
+            let launcher = self
+                .space
+                .elements()
+                .find(|window| {
+                    window.toplevel().is_some_and(|toplevel| {
+                        with_states(toplevel.wl_surface(), |states| {
+                            states
+                                .data_map
+                                .get::<XdgToplevelSurfaceData>()
+                                .and_then(|data| {
+                                    data.lock()
+                                        .ok()
+                                        .and_then(|attributes| attributes.title.clone())
+                                })
+                                .as_deref()
+                                == Some("Applications")
+                        })
+                    })
+                })
+                .cloned();
+
+            if let Some(window) = launcher {
+                self.space.raise_element(&window, true);
+                self.space.elements().for_each(|other| {
+                    other.set_activated(other == &window);
+                    if let Some(toplevel) = other.toplevel() {
+                        toplevel.send_pending_configure();
+                    }
+                });
+                if let Some(surface) = window
+                    .toplevel()
+                    .map(|toplevel| toplevel.wl_surface().clone())
+                {
+                    self.seat.get_keyboard().unwrap().set_focus(
+                        self,
+                        Some(surface),
+                        SERIAL_COUNTER.next_serial(),
+                    );
+                }
+            }
         } else if action == "config:reload" {
             if let Ok(new_cfg) = lua_bridge::load_user_config(&self.config_path) {
                 let mut cur = self.config.lock().unwrap();
@@ -211,29 +264,53 @@ impl Smallvil {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
-                let is_pressed = event.state() == KeyState::Pressed;
+                let key_state = event.state();
+                let is_pressed = key_state == KeyState::Pressed;
 
-                let intercepted = self.seat.get_keyboard().unwrap().input::<String, _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    time,
-                    |state, modifiers, handle| {
-                        if is_pressed {
+                let intercepted = self
+                    .seat
+                    .get_keyboard()
+                    .unwrap()
+                    .input::<Option<String>, _>(
+                        self,
+                        event.key_code(),
+                        key_state,
+                        serial,
+                        time,
+                        |state, modifiers, handle| {
                             let sym = handle.modified_sym();
-                            let cfg = state.config.lock().unwrap();
-                            for (combo, action) in &cfg.keybinds {
-                                if matches_keybind(combo, modifiers, sym) {
-                                    return FilterResult::Intercept(action.clone());
+                            if matches!(sym, Keysym::Super_L | Keysym::Super_R) {
+                                if key_state == KeyState::Pressed {
+                                    state.super_key_pressed = true;
+                                    state.super_combo_used = false;
+                                    return FilterResult::Intercept(None);
+                                }
+
+                                let open_launcher =
+                                    state.super_key_pressed && !state.super_combo_used;
+                                state.super_key_pressed = false;
+                                state.super_combo_used = false;
+                                return FilterResult::Intercept(
+                                    open_launcher.then(|| "shell:launcher".to_string()),
+                                );
+                            }
+
+                            if state.super_key_pressed {
+                                state.super_combo_used = true;
+                            }
+                            if is_pressed {
+                                let cfg = state.config.lock().unwrap();
+                                for (combo, action) in &cfg.keybinds {
+                                    if matches_keybind(combo, modifiers, sym) {
+                                        return FilterResult::Intercept(Some(action.clone()));
+                                    }
                                 }
                             }
-                        }
-                        FilterResult::Forward
-                    },
-                );
+                            FilterResult::Forward
+                        },
+                    );
 
-                if let Some(action) = intercepted {
+                if let Some(Some(action)) = intercepted {
                     self.execute_action(&action);
                 }
             }
@@ -330,10 +407,8 @@ impl Smallvil {
                 }
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    if let Some((window, loc)) = self
-                        .space
-                        .element_under(pos)
-                        .map(|(w, l)| (w.clone(), l))
+                    if let Some((window, loc)) =
+                        self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
                     {
                         self.space.raise_element(&window, true);
                         window.set_activated(true);

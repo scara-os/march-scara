@@ -50,6 +50,8 @@ pub struct Smallvil {
     pub active_workspace: usize,
     pub workspaces: [Vec<(Window, Point<i32, Logical>)>; 5],
     pub last_window_count: usize,
+    pub super_key_pressed: bool,
+    pub super_combo_used: bool,
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -104,6 +106,8 @@ impl Smallvil {
             active_workspace: 0,
             workspaces: Default::default(),
             last_window_count: 0,
+            super_key_pressed: false,
+            super_combo_used: false,
 
             compositor_state,
             xdg_shell_state,
@@ -139,7 +143,10 @@ impl Smallvil {
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
                     unsafe {
-                        display.get_mut().dispatch_clients(&mut state.state).unwrap();
+                        display
+                            .get_mut()
+                            .dispatch_clients(&mut state.state)
+                            .unwrap();
                     }
                     Ok(PostAction::Continue)
                 },
@@ -244,7 +251,8 @@ impl Smallvil {
 
         let next_wins = std::mem::take(&mut self.workspaces[target_ws]);
         for (w, loc) in next_wins {
-            self.space.map_element(w.clone(), (loc.x, loc.y + 36), false);
+            self.space
+                .map_element(w.clone(), (loc.x, loc.y + 36), false);
             self.animate_window_to(w, loc.x, loc.y);
         }
         self.active_workspace = target_ws;
@@ -262,7 +270,10 @@ impl Smallvil {
         let Some(win) = self.space.elements().last().cloned() else {
             return;
         };
-        let loc = self.space.element_location(&win).unwrap_or((140, 74).into());
+        let loc = self
+            .space
+            .element_location(&win)
+            .unwrap_or((140, 74).into());
         self.space.unmap_elem(&win);
         self.workspaces[target_ws].push((win, loc));
 
@@ -272,7 +283,10 @@ impl Smallvil {
         }
     }
 
-    pub fn surface_under(&self, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
         if let Some(output) = self.space.outputs().next() {
             let map = layer_map_for_output(output);
             for level in [WlrLayer::Overlay, WlrLayer::Top] {
@@ -288,11 +302,13 @@ impl Smallvil {
             }
         }
 
-        self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p + location).to_f64()))
-        })
+        self.space
+            .element_under(pos)
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64()))
+            })
     }
 }
 
