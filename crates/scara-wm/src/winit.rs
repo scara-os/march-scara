@@ -88,6 +88,20 @@ pub fn init_winit(
                     let cfg = state.config.lock().unwrap();
                     (cfg.glass_refraction, cfg.blur_passes)
                 };
+                let cursor_location = state
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location())
+                    .and_then(|location| {
+                        let geometry = state.space.output_geometry(&output)?;
+                        let inside = location.x >= f64::from(geometry.loc.x)
+                            && location.y >= f64::from(geometry.loc.y)
+                            && location.x < f64::from(geometry.loc.x + geometry.size.w)
+                            && location.y < f64::from(geometry.loc.y + geometry.size.h);
+                        inside.then(|| {
+                            (location - geometry.loc.to_f64()).to_physical_precise_round(1.0)
+                        })
+                    });
 
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
@@ -101,6 +115,7 @@ pub fn init_winit(
                             size,
                             refraction,
                             blur_passes,
+                            cursor_location,
                         )
                         .unwrap();
                 }

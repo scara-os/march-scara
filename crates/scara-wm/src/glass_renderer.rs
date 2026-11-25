@@ -5,6 +5,7 @@ use smithay::{
             damage::OutputDamageTracker,
             element::{
                 render_elements,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::WaylandSurfaceRenderElement,
                 texture::TextureRenderElement,
                 AsRenderElements, Id, Kind,
@@ -27,6 +28,7 @@ render_elements! {
     pub ScaraRenderElements<=GlesRenderer>;
     Wayland=WaylandSurfaceRenderElement<GlesRenderer>,
     Glass=TextureShaderElement,
+    Cursor=SolidColorRenderElement,
 }
 
 const BLUR_FRAG: &str = r#"
@@ -75,10 +77,20 @@ const LIQUID_GLASS_FRAG: &str = include_str!("../../../assets/shaders/liquid-gla
 pub struct GlassPipeline {
     blur_program: GlesTexProgram,
     glass_program: GlesTexProgram,
+    cursor_rows: Vec<CursorRow>,
     tex_size: Size<i32, Physical>,
     backdrop_tex: Option<GlesTexture>,
     blur_tex_a: Option<GlesTexture>,
     blur_tex_b: Option<GlesTexture>,
+}
+
+struct CursorRow {
+    y: i32,
+    x: i32,
+    fill_x: i32,
+    fill_width: i32,
+    outline: SolidColorBuffer,
+    fill: SolidColorBuffer,
 }
 
 impl GlassPipeline {
@@ -102,9 +114,43 @@ impl GlassPipeline {
             ],
         )?;
 
+        let cursor_shape = [
+            (0, 0, 0, 0, 2),
+            (1, 0, 1, 1, 3),
+            (2, 0, 1, 2, 4),
+            (3, 0, 1, 3, 5),
+            (4, 0, 1, 4, 6),
+            (5, 0, 1, 5, 7),
+            (6, 0, 1, 6, 8),
+            (7, 0, 1, 7, 9),
+            (8, 0, 1, 8, 10),
+            (9, 0, 1, 9, 11),
+            (10, 0, 1, 10, 12),
+            (11, 0, 1, 11, 13),
+            (12, 0, 1, 12, 14),
+            (13, 5, 6, 4, 8),
+            (14, 6, 6, 4, 8),
+            (15, 7, 7, 4, 9),
+            (16, 8, 7, 4, 9),
+            (17, 9, 7, 4, 9),
+            (18, 10, 7, 4, 9),
+        ];
+        let cursor_rows = cursor_shape
+            .into_iter()
+            .map(|(y, x, fill_x, fill_width, width)| CursorRow {
+                y,
+                x,
+                fill_x,
+                fill_width,
+                outline: SolidColorBuffer::new((width, 1), [0.02, 0.02, 0.02, 1.0]),
+                fill: SolidColorBuffer::new((fill_width.max(1), 1), [1.0, 1.0, 1.0, 1.0]),
+            })
+            .collect();
+
         Ok(Self {
             blur_program,
             glass_program,
+            cursor_rows,
             tex_size: (0, 0).into(),
             backdrop_tex: None,
             blur_tex_a: None,
@@ -177,6 +223,7 @@ impl GlassPipeline {
         size: Size<i32, Physical>,
         refraction: f32,
         blur_passes: u32,
+        cursor_location: Option<Point<i32, Physical>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.ensure_textures(renderer, size)?;
 
@@ -348,8 +395,38 @@ impl GlassPipeline {
         // 5. Gabungkan seluruh adegan akhir (Front-to-Back) lalu render ke layar utama
         let backdrop_final = Self::collect_backdrop(renderer, output, space);
         let mut final_elems: Vec<ScaraRenderElements> = Vec::with_capacity(
-            overlay_elems.len() + top_elems.len() + glass_elems.len() + backdrop_final.len(),
+            overlay_elems.len()
+                + top_elems.len()
+                + glass_elems.len()
+                + backdrop_final.len()
+                + self.cursor_rows.len() * 2,
         );
+        if let Some(location) = cursor_location {
+            for row in &self.cursor_rows {
+                if row.fill_width > 0 {
+                    final_elems.push(
+                        SolidColorRenderElement::from_buffer(
+                            &row.fill,
+                            (location.x + row.fill_x, location.y + row.y),
+                            1.0,
+                            1.0,
+                            Kind::Unspecified,
+                        )
+                        .into(),
+                    );
+                }
+                final_elems.push(
+                    SolidColorRenderElement::from_buffer(
+                        &row.outline,
+                        (location.x + row.x, location.y + row.y),
+                        1.0,
+                        1.0,
+                        Kind::Unspecified,
+                    )
+                    .into(),
+                );
+            }
+        }
         final_elems.extend(overlay_elems);
         final_elems.extend(top_elems);
         final_elems.extend(glass_elems);

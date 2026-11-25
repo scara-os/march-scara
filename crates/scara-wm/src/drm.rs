@@ -246,12 +246,24 @@ impl DrmBackend {
 
     fn render_all(&mut self, state: &mut Smallvil) -> Result<(), Box<dyn Error>> {
         state.space.refresh();
+        let pointer_location = state
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location());
 
         for output in &mut self.outputs {
             let (refraction, blur_passes) = {
                 let config = state.config.lock().unwrap();
                 (config.glass_refraction, config.blur_passes)
             };
+            let cursor_location = pointer_location.and_then(|location| {
+                let geometry = state.space.output_geometry(&output.output)?;
+                let inside = location.x >= f64::from(geometry.loc.x)
+                    && location.y >= f64::from(geometry.loc.y)
+                    && location.x < f64::from(geometry.loc.x + geometry.size.w)
+                    && location.y < f64::from(geometry.loc.y + geometry.size.h);
+                inside.then(|| (location - geometry.loc.to_f64()).to_physical_precise_round(1.0))
+            });
             let (mut buffer, _) = output.surface.next_buffer()?;
             let mut framebuffer = self.renderer.bind(&mut buffer)?;
             output.pipeline.render_frame(
@@ -263,6 +275,7 @@ impl DrmBackend {
                 output.size,
                 refraction,
                 blur_passes,
+                cursor_location,
             )?;
 
             output

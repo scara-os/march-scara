@@ -12,7 +12,7 @@ use smithay::{
             Resource,
         },
     },
-    utils::{Rectangle, Serial},
+    utils::{Rectangle, Serial, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         shell::xdg::{
@@ -45,8 +45,26 @@ impl XdgShellHandler for Smallvil {
         } else {
             self.animate_window_to(window, x, y);
         }
+
+        if self.space.elements().count() == 1 {
+            let focus_surface = {
+                self.space.elements().next().and_then(|window| {
+                    window.set_activated(true);
+                    window
+                        .toplevel()
+                        .map(|toplevel| toplevel.wl_surface().clone())
+                })
+            };
+            if let Some(surface) = focus_surface {
+                self.seat.get_keyboard().unwrap().set_focus(
+                    self,
+                    Some(surface),
+                    SERIAL_COUNTER.next_serial(),
+                );
+            }
+        }
     }
-    
+
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
