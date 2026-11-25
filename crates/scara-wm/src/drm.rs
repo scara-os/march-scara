@@ -165,6 +165,15 @@ impl DrmBackend {
                     if device.has_capability(DeviceCapability::Keyboard) {
                         info!(device = %device.name(), "Keyboard added");
                     }
+                    let mut tap_device = device.clone();
+                    if tap_device.config_tap_finger_count() > 0 {
+                        match tap_device.config_tap_set_enabled(true) {
+                            Ok(()) => info!(device = %device.name(), "Enabled touchpad tap-to-click"),
+                            Err(err) => {
+                                warn!(device = %device.name(), ?err, "Failed to enable touchpad tap-to-click");
+                            }
+                        }
+                    }
                 }
                 data.state.process_input_event(event);
             })?;
