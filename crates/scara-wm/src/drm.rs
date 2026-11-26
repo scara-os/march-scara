@@ -22,7 +22,8 @@ use smithay::{
         },
         udev::all_gpus,
     },
-    output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
+    desktop::layer_map_for_output,
+    output::{Mode as WlMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
             timer::{TimeoutAction, Timer},
@@ -36,23 +37,39 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
-use crate::{glass_renderer::GlassPipeline, CalloopData, Smallvil};
+use crate::{
+    display::{self, DisplayAction, DisplayConfig, DisplayMode, DisplayOutputInfo, PendingPreview},
+    glass_renderer::GlassPipeline,
+    CalloopData, Smallvil,
+};
 
 type DrmSurface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
+type OpenedDrmDevice = (
+    DrmDevice,
+    DrmDeviceNotifier,
+    Vec<ConnectedOutput>,
+    GbmDevice<DrmDeviceFd>,
+);
+type OpenDrmDeviceResult = Result<OpenedDrmDevice, Box<dyn Error>>;
 
 struct ConnectedOutput {
     connector: connector::Handle,
     crtc: crtc::Handle,
     mode: Mode,
+    preferred_mode: Mode,
+    modes: Vec<Mode>,
     name: String,
     physical_size: (i32, i32),
     subpixel: Subpixel,
+    scale: i32,
+    location: (i32, i32),
 }
 
 struct OutputState {
     output: Output,
     crtc: crtc::Handle,
     surface: DrmSurface,
+    modes: Vec<Mode>,
     damage_tracker: OutputDamageTracker,
     pipeline: GlassPipeline,
     size: Size<i32, Physical>,
@@ -64,6 +81,7 @@ pub struct DrmBackend {
     drm_device: DrmDevice,
     renderer: GlesRenderer,
     outputs: Vec<OutputState>,
+    pending_preview: Option<PendingPreview>,
 }
 
 impl DrmBackend {
@@ -74,7 +92,15 @@ impl DrmBackend {
         session_notifier: LibSeatSessionNotifier,
     ) -> Result<(), Box<dyn Error>> {
         let seat_name = session.seat();
-        let (mut drm_device, drm_notifier, connected_outputs, gbm) = open_display_device(&session)?;
+        let saved_configs = match display::load_configs() {
+            Ok(configs) => configs,
+            Err(error) => {
+                warn!(%error, "Could not load saved display configuration; using defaults");
+                Vec::new()
+            }
+        };
+        let (mut drm_device, drm_notifier, connected_outputs, gbm) =
+            open_display_device(&session, &saved_configs)?;
 
         let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
         let context = EGLContext::new(&egl_display)?;
@@ -102,10 +128,18 @@ impl DrmBackend {
                 },
             );
             output.create_global::<Smallvil>(&data.display_handle);
-            output.set_preferred(wl_mode);
-            output.change_current_state(Some(wl_mode), None, None, Some((x, 0).into()));
-            data.state.space.map_output(&output, (x, 0));
-            x += size.w;
+            output.set_preferred(WlMode::from(connected.preferred_mode));
+            for mode in &connected.modes {
+                output.add_mode(WlMode::from(*mode));
+            }
+            output.change_current_state(
+                Some(wl_mode),
+                None,
+                Some(Scale::Integer(connected.scale)),
+                Some(connected.location.into()),
+            );
+            data.state.space.map_output(&output, connected.location);
+            x = x.max(connected.location.0.saturating_add(size.w));
 
             let drm_surface = drm_device.create_surface(
                 connected.crtc,
@@ -136,6 +170,7 @@ impl DrmBackend {
                 output,
                 crtc: connected.crtc,
                 surface,
+                modes: connected.modes,
                 damage_tracker,
                 pipeline,
                 size,
@@ -156,6 +191,7 @@ impl DrmBackend {
             drm_device,
             renderer,
             outputs,
+            pending_preview: None,
         });
 
         event_loop
@@ -236,6 +272,7 @@ impl DrmBackend {
                 let Some(backend) = data.drm_backend.as_mut() else {
                     return TimeoutAction::Drop;
                 };
+                backend.revert_expired_display_preview(&mut data.state);
                 if backend.session.is_active() {
                     if let Err(err) = backend.render_all(&mut data.state) {
                         error!(%err, "DRM rendering failed");
@@ -253,6 +290,194 @@ impl DrmBackend {
         Ok(())
     }
 
+    pub fn handle_display_request(&mut self, command: &str, state: &mut Smallvil) -> String {
+        let action = match display::parse_command(command) {
+            Ok(action) => action,
+            Err(error) => return format!("ERROR: {error}"),
+        };
+        match action {
+            DisplayAction::List => {
+                serde_json::to_string(&self.display_outputs()).unwrap_or_else(|error| {
+                    format!("ERROR: Could not serialize display list: {error}")
+                })
+            }
+            DisplayAction::Preview(config) => {
+                if self.pending_preview.is_some() {
+                    return "ERROR: Confirm or cancel the current display preview first.".into();
+                }
+                let Some(previous) = self.current_display_config(&config.name) else {
+                    return format!("ERROR: Unknown display output: {}", config.name);
+                };
+                match self.apply_display_config(&config, state) {
+                    Ok(()) => {
+                        self.pending_preview = Some(PendingPreview {
+                            previous,
+                            expires_at: std::time::Instant::now()
+                                + Duration::from_secs(display::PREVIEW_TIMEOUT_SECS),
+                        });
+                        format!(
+                            "OK: Display preview active for {} seconds; confirm to keep it.",
+                            display::PREVIEW_TIMEOUT_SECS
+                        )
+                    }
+                    Err(error) => format!("ERROR: Could not apply display preview: {error}"),
+                }
+            }
+            DisplayAction::Confirm => {
+                if self.pending_preview.is_none() {
+                    return "ERROR: No display preview is awaiting confirmation.".into();
+                }
+                match self.save_current_display_configs() {
+                    Ok(()) => {
+                        self.pending_preview = None;
+                        "OK: Display configuration saved.".into()
+                    }
+                    Err(error) => format!("ERROR: Could not save display configuration: {error}"),
+                }
+            }
+            DisplayAction::Cancel => {
+                let Some(preview) = self.pending_preview.take() else {
+                    return "ERROR: No display preview is active.".into();
+                };
+                match self.apply_display_config(&preview.previous, state) {
+                    Ok(()) => "OK: Previous display configuration restored.".into(),
+                    Err(error) => {
+                        self.pending_preview = Some(preview);
+                        format!("ERROR: Could not restore previous display configuration: {error}")
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn revert_expired_display_preview(&mut self, state: &mut Smallvil) {
+        let expired = self
+            .pending_preview
+            .as_ref()
+            .is_some_and(|preview| std::time::Instant::now() >= preview.expires_at);
+        if !expired {
+            return;
+        }
+        let preview = self.pending_preview.take().expect("preview was checked");
+        match self.apply_display_config(&preview.previous, state) {
+            Ok(()) => info!("Unconfirmed display preview reverted"),
+            Err(error) => {
+                self.pending_preview = Some(preview);
+                error!(%error, "Failed to revert unconfirmed display preview");
+            }
+        }
+    }
+
+    fn display_outputs(&self) -> Vec<DisplayOutputInfo> {
+        self.outputs
+            .iter()
+            .filter_map(|output| {
+                let current = output.output.current_mode()?;
+                let location = output.output.current_location();
+                let modes = output
+                    .modes
+                    .iter()
+                    .copied()
+                    .map(display_mode_from_drm)
+                    .collect::<Vec<_>>();
+                Some(DisplayOutputInfo {
+                    name: output.output.name(),
+                    backend: "drm".into(),
+                    current: DisplayMode {
+                        width: current.size.w.max(0) as u16,
+                        height: current.size.h.max(0) as u16,
+                        refresh_millihz: current.refresh.max(0) as u32,
+                    },
+                    modes,
+                    scale: output.output.current_scale().integer_scale(),
+                    x: location.x,
+                    y: location.y,
+                })
+            })
+            .collect()
+    }
+
+    fn current_display_config(&self, name: &str) -> Option<DisplayConfig> {
+        let output = self
+            .outputs
+            .iter()
+            .find(|output| output.output.name() == name)?;
+        let mode = output.output.current_mode()?;
+        let location = output.output.current_location();
+        Some(DisplayConfig {
+            name: name.to_string(),
+            mode: DisplayMode {
+                width: mode.size.w.max(0) as u16,
+                height: mode.size.h.max(0) as u16,
+                refresh_millihz: mode.refresh.max(0) as u32,
+            },
+            scale: output.output.current_scale().integer_scale(),
+            x: location.x,
+            y: location.y,
+        })
+    }
+
+    fn apply_display_config(
+        &mut self,
+        config: &DisplayConfig,
+        state: &mut Smallvil,
+    ) -> Result<(), String> {
+        display::validate_config(config).map_err(|error| error.to_string())?;
+        let output = self
+            .outputs
+            .iter_mut()
+            .find(|output| output.output.name() == config.name)
+            .ok_or_else(|| format!("Unknown display output: {}", config.name))?;
+        let mode = output
+            .modes
+            .iter()
+            .copied()
+            .find(|mode| display_mode_from_drm(*mode) == config.mode)
+            .ok_or_else(|| format!("Mode is not supported by {}", config.name))?;
+        output
+            .surface
+            .use_mode(mode)
+            .map_err(|error| error.to_string())?;
+
+        let wl_mode = WlMode::from(mode);
+        output.output.set_preferred(wl_mode);
+        output.output.change_current_state(
+            Some(wl_mode),
+            None,
+            Some(Scale::Integer(config.scale)),
+            Some((config.x, config.y).into()),
+        );
+        let (width, height) = mode.size();
+        output.size = (i32::from(width), i32::from(height)).into();
+        output.damage_tracker = OutputDamageTracker::from_output(&output.output);
+        state.space.map_output(&output.output, (config.x, config.y));
+        layer_map_for_output(&output.output).arrange();
+        Ok(())
+    }
+
+    fn save_current_display_configs(&self) -> Result<(), String> {
+        let configs = self
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let mode = output.output.current_mode()?;
+                let location = output.output.current_location();
+                Some(DisplayConfig {
+                    name: output.output.name(),
+                    mode: DisplayMode {
+                        width: mode.size.w.max(0) as u16,
+                        height: mode.size.h.max(0) as u16,
+                        refresh_millihz: mode.refresh.max(0) as u32,
+                    },
+                    scale: output.output.current_scale().integer_scale(),
+                    x: location.x,
+                    y: location.y,
+                })
+            })
+            .collect::<Vec<_>>();
+        display::update_configs(&configs).map_err(|error| error.to_string())
+    }
+
     fn render_all(&mut self, state: &mut Smallvil) -> Result<(), Box<dyn Error>> {
         state.space.refresh();
         let pointer_location = state
@@ -261,9 +486,13 @@ impl DrmBackend {
             .map(|pointer| pointer.current_location());
 
         for output in &mut self.outputs {
-            let (refraction, blur_passes) = {
+            let (refraction, blur_passes, reduce_transparency) = {
                 let config = state.config.lock().unwrap();
-                (config.glass_refraction, config.blur_passes)
+                (
+                    config.glass_refraction,
+                    config.blur_passes,
+                    config.reduce_transparency,
+                )
             };
             let cursor_location = pointer_location.and_then(|location| {
                 let geometry = state.space.output_geometry(&output.output)?;
@@ -284,6 +513,7 @@ impl DrmBackend {
                 output.size,
                 refraction,
                 blur_passes,
+                reduce_transparency,
                 cursor_location,
             )?;
 
@@ -318,15 +548,8 @@ impl DrmBackend {
 
 fn open_display_device(
     session: &LibSeatSession,
-) -> Result<
-    (
-        DrmDevice,
-        DrmDeviceNotifier,
-        Vec<ConnectedOutput>,
-        GbmDevice<DrmDeviceFd>,
-    ),
-    Box<dyn Error>,
-> {
+    saved_configs: &[DisplayConfig],
+) -> OpenDrmDeviceResult {
     let requested_device = std::env::var_os("SCARA_DRM_DEVICE").map(PathBuf::from);
     let candidates = match requested_device {
         Some(path) => vec![path],
@@ -353,7 +576,7 @@ fn open_display_device(
 
     let mut failures = Vec::new();
     for path in candidates {
-        match open_candidate(session, &path) {
+        match open_candidate(session, &path, saved_configs) {
             Ok((device, notifier, outputs, gbm)) if !outputs.is_empty() => {
                 info!(device = %path.display(), outputs = outputs.len(), "Selected DRM device");
                 return Ok((device, notifier, outputs, gbm));
@@ -401,15 +624,8 @@ fn sysfs_has_connected_output(path: &Path) -> std::io::Result<bool> {
 fn open_candidate(
     session: &LibSeatSession,
     path: &Path,
-) -> Result<
-    (
-        DrmDevice,
-        DrmDeviceNotifier,
-        Vec<ConnectedOutput>,
-        GbmDevice<DrmDeviceFd>,
-    ),
-    Box<dyn Error>,
-> {
+    saved_configs: &[DisplayConfig],
+) -> OpenDrmDeviceResult {
     let mut session = session.clone();
     let fd = session.open(
         path,
@@ -417,7 +633,7 @@ fn open_candidate(
     )?;
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
     let (device, notifier) = DrmDevice::new(fd.clone(), true)?;
-    let outputs = connected_outputs(&device)?;
+    let outputs = connected_outputs(&device, saved_configs)?;
     if outputs.is_empty() {
         return Ok((device, notifier, outputs, GbmDevice::new(fd)?));
     }
@@ -425,10 +641,14 @@ fn open_candidate(
     Ok((device, notifier, outputs, gbm))
 }
 
-fn connected_outputs(device: &DrmDevice) -> Result<Vec<ConnectedOutput>, Box<dyn Error>> {
+fn connected_outputs(
+    device: &DrmDevice,
+    saved_configs: &[DisplayConfig],
+) -> Result<Vec<ConnectedOutput>, Box<dyn Error>> {
     let resources = device.resource_handles()?;
     let mut used_crtcs = HashSet::new();
     let mut outputs = Vec::new();
+    let mut next_default_x = 0;
 
     for connector_handle in resources.connectors() {
         let Ok(connector) = device.get_connector(*connector_handle, true) else {
@@ -461,27 +681,59 @@ fn connected_outputs(device: &DrmDevice) -> Result<Vec<ConnectedOutput>, Box<dyn
             continue;
         };
 
-        let mode = connector
-            .modes()
+        let modes = connector.modes().to_vec();
+        let preferred_mode = modes
             .iter()
             .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
             .copied()
-            .unwrap_or(connector.modes()[0]);
+            .unwrap_or(modes[0]);
+        let name = format!(
+            "{}-{}",
+            connector.interface().as_str(),
+            connector.interface_id()
+        );
+        let saved = saved_configs.iter().find(|config| config.name == name);
+        let mode = saved
+            .and_then(|config| {
+                modes
+                    .iter()
+                    .copied()
+                    .find(|mode| display_mode_from_drm(*mode) == config.mode)
+            })
+            .unwrap_or(preferred_mode);
+        if saved.is_some_and(|config| display_mode_from_drm(mode) != config.mode) {
+            warn!(output = %name, "Saved display mode is unavailable; using the preferred mode");
+        }
+        let scale = saved.map(|config| config.scale).unwrap_or(1);
+        let (width, _) = mode.size();
+        let location = saved
+            .map(|config| (config.x, config.y))
+            .unwrap_or((next_default_x, 0));
+        next_default_x = location.0.saturating_add(i32::from(width) / scale.max(1));
         let (width_mm, height_mm) = connector.size().unwrap_or((0, 0));
         used_crtcs.insert(crtc);
         outputs.push(ConnectedOutput {
             connector: *connector_handle,
             crtc,
             mode,
-            name: format!(
-                "{}-{}",
-                connector.interface().as_str(),
-                connector.interface_id()
-            ),
+            preferred_mode,
+            modes,
+            name,
             physical_size: (width_mm as i32, height_mm as i32),
             subpixel: connector.subpixel().into(),
+            scale,
+            location,
         });
     }
 
     Ok(outputs)
+}
+
+fn display_mode_from_drm(mode: Mode) -> DisplayMode {
+    let mode = WlMode::from(mode);
+    DisplayMode {
+        width: mode.size.w.max(0) as u16,
+        height: mode.size.h.max(0) as u16,
+        refresh_millihz: mode.refresh.max(0) as u32,
+    }
 }

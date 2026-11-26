@@ -112,7 +112,7 @@ fn read_from(path: &Path) -> io::Result<UserPreferences> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(UserPreferences::default())
+            return Ok(UserPreferences::default());
         }
         Err(error) => return Err(error),
     };

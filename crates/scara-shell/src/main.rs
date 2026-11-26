@@ -6,11 +6,15 @@ use gtk::{
     SearchEntry, Separator, Stack, Switch,
 };
 use gtk_layer_shell::{Edge, Layer, LayerShell};
+use serde::Deserialize;
 use std::{
     cell::{Cell, RefCell},
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
+    path::{Path, PathBuf},
     process::Command,
     rc::Rc,
     sync::mpsc::{self, Receiver},
@@ -371,6 +375,24 @@ struct DesktopApp {
     icon: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct DisplayMode {
+    width: u16,
+    height: u16,
+    refresh_millihz: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct DisplayOutputInfo {
+    name: String,
+    backend: String,
+    current: DisplayMode,
+    modes: Vec<DisplayMode>,
+    scale: i32,
+    x: i32,
+    y: i32,
+}
+
 fn launch_app(cmd: &str) {
     let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
 }
@@ -387,6 +409,41 @@ fn send_wm_ipc(action: &str) {
         }
     }
     let _ = Command::new("scara-ctl").arg(action).spawn();
+}
+
+fn run_wm_ctl_output(action: &str) -> Result<String, String> {
+    let sibling_ctl = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|directory| directory.join("scara-ctl")))
+        .filter(|path| path.is_file());
+    let program = sibling_ctl.unwrap_or_else(|| PathBuf::from("scara-ctl"));
+    let output = Command::new(program)
+        .arg(action)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("scara-ctl exited with {}", output.status)
+        } else {
+            detail
+        });
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if response.starts_with("ERROR:") {
+        return Err(response);
+    }
+    Ok(response)
+}
+
+fn set_compositor_reduce_transparency(enabled: bool) -> Result<(), String> {
+    let action = if enabled {
+        "appearance:reduce-transparency:on"
+    } else {
+        "appearance:reduce-transparency:off"
+    };
+    run_wm_ctl_output(action).map(|_| ())
 }
 
 fn show_launcher(window: &ApplicationWindow, search: &SearchEntry) {
@@ -443,16 +500,6 @@ fn start_shell_ipc() -> Receiver<String> {
     receiver
 }
 
-fn run_cmd_output(cmd: &str) -> String {
-    Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
 fn run_program_output(program: &str, args: &[&str]) -> Result<String, String> {
     let args = args
         .iter()
@@ -476,6 +523,341 @@ fn run_system_command_output(program: &str, args: &[String]) -> Result<String, S
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn find_program_on_path(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(program))
+        .find(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
+fn user_config_file(
+    app_directory: &str,
+    file_name: &str,
+    initial_contents: &str,
+) -> Result<PathBuf, String> {
+    let config_home = if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| "HOME is not set.".to_string())?)
+            .join(".config")
+    };
+    let directory = config_home.join(app_directory);
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    let path = directory.join(file_name);
+    if !path.exists() {
+        std::fs::write(&path, initial_contents)
+            .map_err(|error| format!("Could not create {}: {error}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn open_user_config(
+    app_directory: &str,
+    file_name: &str,
+    initial_contents: &str,
+) -> Result<PathBuf, String> {
+    let path = user_config_file(app_directory, file_name, initial_contents)?;
+    Command::new("gnome-text-editor")
+        .arg(&path)
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Could not open {} in GNOME Text Editor: {error}",
+                path.display()
+            )
+        })?;
+    Ok(path)
+}
+
+fn notification_mode_active(output: &str, mode: &str) -> bool {
+    output
+        .split_whitespace()
+        .any(|active_mode| active_mode == mode)
+}
+
+fn mako_focus_status() -> Result<bool, String> {
+    mako_focus_status_with(run_program_output)
+}
+
+fn mako_focus_status_with(
+    run: impl FnOnce(&str, &[&str]) -> Result<String, String>,
+) -> Result<bool, String> {
+    let modes = run("makoctl", &["mode"])?;
+    Ok(notification_mode_active(&modes, "do-not-disturb"))
+}
+
+fn printer_status() -> Result<String, String> {
+    printer_status_with(run_program_output)
+}
+
+fn printer_status_with(
+    mut run: impl FnMut(&str, &[&str]) -> Result<String, String>,
+) -> Result<String, String> {
+    let printers = run("lpstat", &["-p"])?;
+    let default_printer = run("lpstat", &["-d"])?;
+    let queued_jobs = run("lpstat", &["-o"])?;
+    let printers = if printers.trim().is_empty() {
+        "No printers are configured.".to_string()
+    } else {
+        printers
+    };
+    let default_printer = if default_printer.trim().is_empty() {
+        "Default printer: not set.".to_string()
+    } else {
+        default_printer
+    };
+    let queued_jobs = if queued_jobs.trim().is_empty() {
+        "Print queue: empty.".to_string()
+    } else {
+        format!("Print queue:\n{queued_jobs}")
+    };
+    Ok(format!("{printers}\n{default_printer}\n{queued_jobs}"))
+}
+
+fn refresh_printer_status(status: &Label) {
+    status.set_text("Querying the host print service…");
+    let status = status.clone();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(printer_status());
+    });
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(summary)) => {
+                status.set_text(&summary);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status.set_text(&format!("Print service unavailable: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_text("Print service query ended without a result.");
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn home_storage_categories() -> Result<String, String> {
+    let home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| "HOME is not set.".to_string())?);
+    let mut categories = Vec::new();
+    for (name, directory) in [
+        ("Documents", "Documents"),
+        ("Downloads", "Downloads"),
+        ("Pictures", "Pictures"),
+        ("Music", "Music"),
+        ("Videos", "Videos"),
+    ] {
+        let path = home.join(directory);
+        if !path.is_dir() {
+            continue;
+        }
+        let output = Command::new("du")
+            .args(["-sh", "--"])
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("Could not measure {}: {error}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Could not measure {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let size = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| format!("No disk usage was returned for {}.", path.display()))?
+            .to_string();
+        categories.push(format!("{name}: {size}"));
+    }
+    if categories.is_empty() {
+        Ok("No standard user folders were found.".to_string())
+    } else {
+        Ok(categories.join("\n"))
+    }
+}
+
+fn input_device_summary(kind: &str) -> Result<String, String> {
+    let output = run_program_output("libinput", &["list-devices"])?;
+    Ok(parse_libinput_device_summary(&output, kind))
+}
+
+fn parse_libinput_device_summary(output: &str, kind: &str) -> String {
+    let mut devices = Vec::new();
+    let mut block = Vec::new();
+    for line in output.lines() {
+        if let Some(name) = line.trim().strip_prefix("Device:") {
+            if !block.is_empty() {
+                append_input_device_summary(&mut devices, &block, kind);
+                block.clear();
+            }
+            block.push(format!("Device: {}", name.trim()));
+        } else if !block.is_empty() {
+            block.push(line.trim().to_string());
+        }
+    }
+    if !block.is_empty() {
+        append_input_device_summary(&mut devices, &block, kind);
+    }
+    if devices.is_empty() {
+        format!("No {kind} devices were reported by libinput.")
+    } else {
+        devices.join("\n\n")
+    }
+}
+
+fn append_input_device_summary(devices: &mut Vec<String>, block: &[String], kind: &str) {
+    let name = block
+        .first()
+        .and_then(|line| line.strip_prefix("Device: "))
+        .unwrap_or("Unknown input device");
+    let name_lower = name.to_ascii_lowercase();
+    let is_touchpad = name_lower.contains("touchpad") || name_lower.contains("trackpad");
+    if (kind == "touchpad" && !is_touchpad)
+        || (kind == "pointer"
+            && (is_touchpad
+                || !block
+                    .iter()
+                    .any(|line| line.starts_with("Capabilities:") && line.contains("pointer"))))
+    {
+        return;
+    }
+    let mut details = vec![format!("Device: {name}")];
+    details.extend(block.iter().filter_map(|line| {
+        [
+            "Kernel:",
+            "Capabilities:",
+            "Tap-to-click:",
+            "Tap-and-drag:",
+            "Natural scrolling:",
+            "Scroll methods:",
+            "Accel profiles:",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        .then(|| line.to_string())
+    }));
+    devices.push(details.join("\n"));
+}
+
+fn append_home_storage_categories(page: &GtkBox) {
+    let card = settings_card(
+        "User storage categories",
+        "Approximate usage in standard home folders. Folder sizes are computed in the background.",
+    );
+    let status = Label::new(Some(
+        "Scanning Documents, Downloads, Pictures, Music, and Videos…",
+    ));
+    status.add_css_class("cc-sub");
+    status.set_halign(Align::Start);
+    status.set_wrap(true);
+    card.append(&status);
+    page.append(&card);
+
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(home_storage_categories());
+    });
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(summary)) => {
+                status.set_text(&summary);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status.set_text(&format!("Storage category scan failed: {error}"));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_text("Storage category scan ended without a result.");
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn configured_portal_backend<'a>(configuration: &'a str, interface: &str) -> Option<&'a str> {
+    let mut default_backend = None;
+    for line in configuration.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() == interface {
+            return Some(value.trim());
+        }
+        if key.trim() == "default" {
+            default_backend = Some(value.trim());
+        }
+    }
+    default_backend
+}
+
+fn portal_backend_implements(backend: &str, interface: &str) -> Result<(), String> {
+    let descriptor =
+        Path::new("/usr/share/xdg-desktop-portal/portals").join(format!("{backend}.portal"));
+    let contents = std::fs::read_to_string(&descriptor)
+        .map_err(|error| format!("Could not read {}: {error}", descriptor.display()))?;
+    let interfaces = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Interfaces="))
+        .unwrap_or_default();
+    if interfaces.split(';').any(|entry| entry.trim() == interface) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The {backend} portal backend does not advertise {interface}."
+        ))
+    }
+}
+
+fn dbus_interface_available(
+    bus: &str,
+    service: &str,
+    object_path: &str,
+    interface: &str,
+) -> Result<(), String> {
+    dbus_interface_available_with(bus, service, object_path, interface, run_program_output)
+}
+
+fn dbus_interface_available_with(
+    bus: &str,
+    service: &str,
+    object_path: &str,
+    interface: &str,
+    run: impl FnOnce(&str, &[&str]) -> Result<String, String>,
+) -> Result<(), String> {
+    run(
+        "busctl",
+        &[bus, "introspect", service, object_path, interface],
+    )
+    .map(|_| ())
+}
+
+fn secret_service_status(check: impl FnOnce() -> Result<(), String>) -> String {
+    check()
+        .map(|()| {
+            "Secret Service is available. Credentials remain managed by the host keyring."
+                .to_string()
+        })
+        .unwrap_or_else(|error| {
+            format!("Secret Service unavailable; check the host keyring: {error}")
+        })
 }
 
 fn run_system_command_async<F>(
@@ -563,6 +945,116 @@ struct BluetoothDevice {
     name: String,
     paired: bool,
     connected: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct AudioDevice {
+    name: String,
+}
+
+#[derive(Debug, PartialEq)]
+struct BatteryHistorySample {
+    timestamp: u64,
+    percentage: f64,
+    state: u32,
+}
+
+fn parse_battery_history(output: &str) -> Result<Vec<BatteryHistorySample>, String> {
+    let mut fields = output.split_whitespace();
+    if fields.next() != Some("a(udu)") {
+        return Err("UPower returned an unexpected history format.".to_string());
+    }
+    let count = fields
+        .next()
+        .ok_or_else(|| "UPower returned an incomplete history response.".to_string())?
+        .parse::<usize>()
+        .map_err(|_| "UPower returned an invalid history count.".to_string())?;
+    let mut samples = Vec::with_capacity(count);
+    for _ in 0..count {
+        let timestamp = fields
+            .next()
+            .ok_or_else(|| "UPower returned a truncated history response.".to_string())?
+            .parse::<u64>()
+            .map_err(|_| "UPower returned an invalid history timestamp.".to_string())?;
+        let percentage = fields
+            .next()
+            .ok_or_else(|| "UPower returned a truncated history response.".to_string())?
+            .parse::<f64>()
+            .map_err(|_| "UPower returned an invalid history percentage.".to_string())?;
+        let state = fields
+            .next()
+            .ok_or_else(|| "UPower returned a truncated history response.".to_string())?
+            .parse::<u32>()
+            .map_err(|_| "UPower returned an invalid history state.".to_string())?;
+        if timestamp > 0 && (0.0..=100.0).contains(&percentage) {
+            samples.push(BatteryHistorySample {
+                timestamp,
+                percentage,
+                state,
+            });
+        }
+    }
+    if fields.next().is_some() {
+        return Err("UPower returned more history data than declared.".to_string());
+    }
+    Ok(samples)
+}
+
+fn parse_power_profiles(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().strip_prefix("* ").unwrap_or(line.trim());
+            let profile = line.strip_suffix(':')?;
+            (!profile.is_empty()
+                && profile
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '-'))
+            .then(|| profile.to_string())
+        })
+        .collect()
+}
+
+fn parse_audio_devices(output: &str, include_monitors: bool) -> Vec<AudioDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            fields.next()?;
+            let name = fields.next()?.trim();
+            if name.is_empty() || (!include_monitors && name.ends_with(".monitor")) {
+                return None;
+            }
+            Some(AudioDevice {
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_audio_channel_volumes(output: &str) -> Vec<f64> {
+    output
+        .split_whitespace()
+        .filter(|token| token.contains('%'))
+        .filter_map(|token| {
+            let value = token
+                .trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
+                .parse::<f64>()
+                .ok()?;
+            (0.0..=150.0).contains(&value).then_some(value)
+        })
+        .collect()
+}
+
+fn audio_balance_from_volumes(volumes: &[f64]) -> Option<f64> {
+    let [left, right, ..] = volumes else {
+        return None;
+    };
+    let maximum = left.max(*right);
+    if maximum <= 0.0 {
+        return Some(0.0);
+    }
+    Some(((right - left) / maximum * 100.0).clamp(-100.0, 100.0))
 }
 
 fn parse_bluetooth_powered(output: &str) -> Option<bool> {
@@ -940,6 +1432,50 @@ fn find_wallpaper_path() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+fn discover_wallpapers() -> Result<Vec<PathBuf>, String> {
+    let mut directories = vec![PathBuf::from("/usr/share/backgrounds")];
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join("Pictures/Wallpapers"));
+    }
+
+    let mut wallpapers = Vec::new();
+    for directory in directories {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("Could not read {}: {error}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Could not read an entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "jpg" | "jpeg" | "png" | "webp"
+                        )
+                    })
+            {
+                continue;
+            }
+            wallpapers.push(path);
+        }
+    }
+    wallpapers.sort();
+    wallpapers.dedup();
+    Ok(wallpapers)
+}
+
 fn update_preferences(
     current: &Rc<RefCell<UserPreferences>>,
     update: impl FnOnce(&mut UserPreferences),
@@ -1101,6 +1637,7 @@ fn battery_paths() -> Vec<PathBuf> {
             ["BAT0", "BAT1"].map(|name| PathBuf::from("/sys/class/power_supply").join(name)),
         );
     }
+
     batteries
 }
 
@@ -1150,6 +1687,31 @@ fn read_battery_health() -> (Option<String>, Option<String>) {
         }
     }
     (None, None)
+}
+
+fn read_battery_history() -> Result<Vec<BatteryHistorySample>, String> {
+    let devices = run_program_output("upower", &["-e"])?;
+    let device = devices
+        .lines()
+        .find(|path| path.contains("/battery_"))
+        .ok_or_else(|| "UPower did not report a battery device.".to_string())?;
+    let output = run_program_output(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=3s",
+            "call",
+            "org.freedesktop.UPower",
+            device,
+            "org.freedesktop.UPower.Device",
+            "GetHistory",
+            "suu",
+            "charge",
+            "86400",
+            "3600",
+        ],
+    )?;
+    parse_battery_history(&output)
 }
 
 fn battery_health_percentage(full: u64, design: u64) -> Option<f64> {
@@ -1428,6 +1990,689 @@ fn settings_page(title: &str, description: &str) -> GtkBox {
     page
 }
 
+fn append_display_output_cards(page: &GtkBox) {
+    let outputs = match run_wm_ctl_output("display:list").and_then(|response| {
+        serde_json::from_str::<Vec<DisplayOutputInfo>>(&response).map_err(|error| error.to_string())
+    }) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            add_settings_integration_note(
+                page,
+                "Display settings unavailable",
+                &format!("Could not read outputs from the active compositor: {error}"),
+            );
+            return;
+        }
+    };
+
+    if outputs.is_empty() {
+        add_settings_integration_note(
+            page,
+            "No displays found",
+            "The active compositor did not report any connected display outputs.",
+        );
+        return;
+    }
+
+    for output in outputs {
+        let current_refresh = f64::from(output.current.refresh_millihz) / 1000.0;
+        let logical_width = i32::from(output.current.width) / output.scale.max(1);
+        let logical_height = i32::from(output.current.height) / output.scale.max(1);
+        let detail = format!(
+            "{} backend · {} × {} at {:.2} Hz · logical {} × {} · scale {}x · position ({}, {})",
+            output.backend,
+            output.current.width,
+            output.current.height,
+            current_refresh,
+            logical_width,
+            logical_height,
+            output.scale,
+            output.x,
+            output.y
+        );
+        let card = settings_card(&output.name, &detail);
+        let mut modes = output.modes;
+        if !modes.contains(&output.current) {
+            modes.push(output.current.clone());
+        }
+        modes.sort_by_key(|mode| (mode.width, mode.height, mode.refresh_millihz));
+        modes.dedup();
+        let mode_labels = modes
+            .iter()
+            .map(|mode| {
+                format!(
+                    "{} × {} at {:.2} Hz",
+                    mode.width,
+                    mode.height,
+                    f64::from(mode.refresh_millihz) / 1000.0
+                )
+            })
+            .collect::<Vec<_>>();
+        let mode_dropdown =
+            DropDown::from_strings(&mode_labels.iter().map(String::as_str).collect::<Vec<_>>());
+        let current_mode_index = modes
+            .iter()
+            .position(|mode| mode == &output.current)
+            .unwrap_or(0);
+        mode_dropdown.set_selected(current_mode_index as u32);
+        card.append(&settings_control_row(
+            "Resolution and refresh rate",
+            &mode_dropdown,
+        ));
+
+        let scale_dropdown =
+            DropDown::from_strings(&["100% (1x)", "200% (2x)", "300% (3x)", "400% (4x)"]);
+        scale_dropdown.set_selected((output.scale.clamp(1, 4) - 1) as u32);
+        card.append(&settings_control_row("Scale", &scale_dropdown));
+
+        let x_position = gtk::SpinButton::with_range(-16384.0, 16384.0, 1.0);
+        x_position.set_value(f64::from(output.x));
+        let y_position = gtk::SpinButton::with_range(-16384.0, 16384.0, 1.0);
+        y_position.set_value(f64::from(output.y));
+        card.append(&settings_control_row("Horizontal position", &x_position));
+        card.append(&settings_control_row("Vertical position", &y_position));
+
+        let actions = GtkBox::new(Orientation::Horizontal, 8);
+        let apply = Button::with_label("Preview changes");
+        apply.add_css_class("flat");
+        apply.add_css_class("menu-action-btn");
+        let confirm = Button::with_label("Keep");
+        confirm.add_css_class("flat");
+        confirm.add_css_class("menu-action-btn");
+        let cancel = Button::with_label("Revert");
+        cancel.add_css_class("flat");
+        cancel.add_css_class("menu-action-btn");
+        actions.append(&apply);
+        actions.append(&confirm);
+        actions.append(&cancel);
+        card.append(&actions);
+
+        let status = Label::new(Some(
+            "Changes are previewed for 15 seconds before automatic revert.",
+        ));
+        status.add_css_class("cc-sub");
+        status.set_halign(Align::Start);
+        status.set_wrap(true);
+        card.append(&status);
+
+        let output_name = output.name;
+        let modes_for_apply = modes.clone();
+        let mode_dropdown_for_apply = mode_dropdown.clone();
+        let scale_dropdown_for_apply = scale_dropdown.clone();
+        let x_for_apply = x_position.clone();
+        let y_for_apply = y_position.clone();
+        let status_for_apply = status.clone();
+        apply.connect_clicked(move |_| {
+            let selected_mode = mode_dropdown_for_apply.selected() as usize;
+            let Some(mode) = modes_for_apply.get(selected_mode) else {
+                status_for_apply.set_text("Select a supported display mode first.");
+                return;
+            };
+            let scale = scale_dropdown_for_apply.selected().saturating_add(1);
+            let command = format!(
+                "display:preview:{}:{}:{}:{}:{}:{}:{}",
+                output_name,
+                mode.width,
+                mode.height,
+                mode.refresh_millihz,
+                scale,
+                x_for_apply.value_as_int(),
+                y_for_apply.value_as_int()
+            );
+            match run_wm_ctl_output(&command) {
+                Ok(response) => status_for_apply.set_text(&response),
+                Err(error) => status_for_apply.set_text(&error),
+            }
+        });
+
+        let status_for_confirm = status.clone();
+        confirm.connect_clicked(move |_| match run_wm_ctl_output("display:confirm") {
+            Ok(response) => status_for_confirm.set_text(&response),
+            Err(error) => status_for_confirm.set_text(&error),
+        });
+        let status_for_cancel = status.clone();
+        cancel.connect_clicked(move |_| match run_wm_ctl_output("display:cancel") {
+            Ok(response) => status_for_cancel.set_text(&response),
+            Err(error) => status_for_cancel.set_text(&error),
+        });
+
+        page.append(&card);
+    }
+}
+
+fn append_sound_settings(page: &GtkBox) {
+    let server_info = match run_program_output("pactl", &["info"]) {
+        Ok(info) => info,
+        Err(error) => {
+            add_settings_integration_note(
+                page,
+                "PipeWire audio unavailable",
+                &format!(
+                    "Could not connect to the audio server through PipeWire's PulseAudio interface: {error}"
+                ),
+            );
+            add_settings_tool(page, "Open audio mixer", "pavucontrol", &[]);
+            return;
+        }
+    };
+    let server_name = server_info
+        .lines()
+        .find_map(|line| line.strip_prefix("Server Name:").map(str::trim))
+        .unwrap_or("Unknown audio server");
+    page.append(&settings_card("Audio server", server_name));
+
+    let output_devices = match run_program_output("pactl", &["list", "short", "sinks"]) {
+        Ok(output) => parse_audio_devices(&output, true),
+        Err(error) => {
+            add_settings_integration_note(
+                page,
+                "Output devices unavailable",
+                &format!("Could not enumerate audio outputs: {error}"),
+            );
+            Vec::new()
+        }
+    };
+
+    if output_devices.is_empty() {
+        add_settings_integration_note(
+            page,
+            "No audio outputs found",
+            "The audio server did not report any output devices.",
+        );
+    } else {
+        let default_output_result = run_program_output("pactl", &["get-default-sink"]);
+        let default_output = default_output_result.as_ref().ok().cloned();
+        let default_output_found = default_output
+            .as_ref()
+            .is_some_and(|name| output_devices.iter().any(|device| &device.name == name));
+        let initial_output_index = default_output
+            .as_ref()
+            .and_then(|name| {
+                output_devices
+                    .iter()
+                    .position(|device| &device.name == name)
+            })
+            .unwrap_or(0);
+        let output_labels = output_devices
+            .iter()
+            .map(|device| device.name.replace('_', " "))
+            .collect::<Vec<_>>();
+        let output_dropdown =
+            DropDown::from_strings(&output_labels.iter().map(String::as_str).collect::<Vec<_>>());
+        output_dropdown.set_selected(initial_output_index as u32);
+        let output_card = settings_card("Output", "Choose the default speaker or headphone.");
+        output_card.append(&settings_control_row("Default output", &output_dropdown));
+
+        let initial_output_name = output_devices[initial_output_index].name.clone();
+        let output_volume = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+        let output_channels = Rc::new(RefCell::new(Vec::<f64>::new()));
+        let mut output_initial_status = match &default_output_result {
+            Err(error) => Some(format!("Could not identify the default output: {error}")),
+            Ok(name) if !default_output_found => Some(format!(
+                "Default output {name} was not in the enumerated device list; selecting a device will set it."
+            )),
+            Ok(_) => None,
+        };
+        match run_program_output("pactl", &["get-sink-volume", &initial_output_name]) {
+            Ok(volume_text) => {
+                let volumes = parse_audio_channel_volumes(&volume_text);
+                if let Some(volume) = volumes.iter().copied().reduce(f64::max) {
+                    output_volume.set_value(volume);
+                } else {
+                    output_initial_status =
+                        Some("The audio server did not report output volume channels.".into());
+                }
+                output_channels.replace(volumes);
+            }
+            Err(error) => {
+                output_initial_status = Some(format!("Could not read output volume: {error}"));
+            }
+        }
+        output_card.append(&settings_control_row("Output volume", &output_volume));
+
+        let output_balance = Scale::with_range(Orientation::Horizontal, -100.0, 100.0, 1.0);
+        output_balance
+            .set_value(audio_balance_from_volumes(&output_channels.borrow()).unwrap_or_default());
+        output_balance.set_sensitive(output_channels.borrow().len() == 2);
+        output_card.append(&settings_control_row(
+            "Balance (left to right)",
+            &output_balance,
+        ));
+
+        let output_initial_status = output_initial_status
+            .unwrap_or_else(|| "Changes are applied through the active audio server.".into());
+        let output_status = Label::new(Some(&output_initial_status));
+        output_status.add_css_class("cc-sub");
+        output_status.set_halign(Align::Start);
+        output_status.set_wrap(true);
+        output_card.append(&output_status);
+
+        let active_output = Rc::new(RefCell::new(initial_output_name));
+        let updating_output_controls = Rc::new(Cell::new(false));
+        let output_name_for_volume = active_output.clone();
+        let channels_for_volume = output_channels.clone();
+        let balance_for_volume = output_balance.clone();
+        let updating_for_volume = updating_output_controls.clone();
+        let status_for_volume = output_status.clone();
+        output_volume.connect_value_changed(move |slider| {
+            if updating_for_volume.get() {
+                return;
+            }
+            let name = output_name_for_volume.borrow().clone();
+            let volume = slider.value().round();
+            let balance = balance_for_volume.value() / 100.0;
+            let result = if channels_for_volume.borrow().len() == 2 {
+                let left = volume * if balance > 0.0 { 1.0 - balance } else { 1.0 };
+                let right = volume * if balance < 0.0 { 1.0 + balance } else { 1.0 };
+                run_program_output(
+                    "pactl",
+                    &[
+                        "set-sink-volume",
+                        &name,
+                        &format!("{left:.0}%"),
+                        &format!("{right:.0}%"),
+                    ],
+                )
+            } else {
+                run_program_output(
+                    "pactl",
+                    &["set-sink-volume", &name, &format!("{volume:.0}%")],
+                )
+            };
+            match result {
+                Ok(_) => status_for_volume.set_text("Output volume applied."),
+                Err(error) => {
+                    status_for_volume.set_text(&format!("Could not set output volume: {error}"))
+                }
+            }
+        });
+
+        let output_name_for_balance = active_output.clone();
+        let volume_for_balance = output_volume.clone();
+        let channels_for_balance = output_channels.clone();
+        let updating_for_balance = updating_output_controls.clone();
+        let status_for_balance = output_status.clone();
+        output_balance.connect_value_changed(move |slider| {
+            if updating_for_balance.get() {
+                return;
+            }
+            if channels_for_balance.borrow().len() != 2 {
+                status_for_balance.set_text("Balance is supported only for stereo output devices.");
+                return;
+            }
+            let name = output_name_for_balance.borrow().clone();
+            let volume = volume_for_balance.value().round();
+            let balance = slider.value() / 100.0;
+            let left = volume * if balance > 0.0 { 1.0 - balance } else { 1.0 };
+            let right = volume * if balance < 0.0 { 1.0 + balance } else { 1.0 };
+            match run_program_output(
+                "pactl",
+                &[
+                    "set-sink-volume",
+                    &name,
+                    &format!("{left:.0}%"),
+                    &format!("{right:.0}%"),
+                ],
+            ) {
+                Ok(_) => status_for_balance.set_text("Output balance applied."),
+                Err(error) => {
+                    status_for_balance.set_text(&format!("Could not set output balance: {error}"))
+                }
+            }
+        });
+
+        let devices_for_select = output_devices;
+        let active_for_select = active_output.clone();
+        let channels_for_select = output_channels.clone();
+        let volume_for_select = output_volume.clone();
+        let balance_for_select = output_balance.clone();
+        let updating_for_select = updating_output_controls.clone();
+        let status_for_select = output_status.clone();
+        output_dropdown.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected() as usize;
+            let Some(device) = devices_for_select.get(selected) else {
+                return;
+            };
+            match run_program_output("pactl", &["set-default-sink", &device.name]) {
+                Ok(_) => {
+                    active_for_select.replace(device.name.clone());
+                    match run_program_output("pactl", &["get-sink-volume", &device.name]) {
+                        Ok(volume_text) => {
+                            let volumes = parse_audio_channel_volumes(&volume_text);
+                            channels_for_select.replace(volumes.clone());
+                            updating_for_select.set(true);
+                            balance_for_select.set_sensitive(volumes.len() == 2);
+                            if let Some(balance) = audio_balance_from_volumes(&volumes) {
+                                balance_for_select.set_value(balance);
+                            }
+                            if let Some(volume) = volumes.iter().copied().reduce(f64::max) {
+                                volume_for_select.set_value(volume);
+                            }
+                            updating_for_select.set(false);
+                            status_for_select.set_text("Default output changed.");
+                        }
+                        Err(error) => status_for_select.set_text(&format!(
+                            "Default output changed, but its volume could not be read: {error}"
+                        )),
+                    }
+                }
+                Err(error) => {
+                    status_for_select.set_text(&format!("Could not select default output: {error}"))
+                }
+            }
+        });
+        page.append(&output_card);
+    }
+
+    let input_devices = match run_program_output("pactl", &["list", "short", "sources"]) {
+        Ok(output) => parse_audio_devices(&output, false),
+        Err(error) => {
+            add_settings_integration_note(
+                page,
+                "Input devices unavailable",
+                &format!("Could not enumerate microphones: {error}"),
+            );
+            Vec::new()
+        }
+    };
+
+    if input_devices.is_empty() {
+        add_settings_integration_note(
+            page,
+            "No microphones found",
+            "The audio server did not report any microphone input devices.",
+        );
+    } else {
+        let default_input_result = run_program_output("pactl", &["get-default-source"]);
+        let default_input = default_input_result.as_ref().ok().cloned();
+        let default_input_found = default_input
+            .as_ref()
+            .is_some_and(|name| input_devices.iter().any(|device| &device.name == name));
+        let initial_input_index = default_input
+            .as_ref()
+            .and_then(|name| input_devices.iter().position(|device| &device.name == name))
+            .unwrap_or(0);
+        let input_labels = input_devices
+            .iter()
+            .map(|device| device.name.replace('_', " "))
+            .collect::<Vec<_>>();
+        let input_dropdown =
+            DropDown::from_strings(&input_labels.iter().map(String::as_str).collect::<Vec<_>>());
+        input_dropdown.set_selected(initial_input_index as u32);
+        let input_card = settings_card("Input", "Choose and adjust the default microphone.");
+        input_card.append(&settings_control_row("Default input", &input_dropdown));
+
+        let initial_input_name = input_devices[initial_input_index].name.clone();
+        let input_volume = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
+        let mut input_initial_status = match &default_input_result {
+            Err(error) => Some(format!("Could not identify the default input: {error}")),
+            Ok(name) if !default_input_found => Some(format!(
+                "Default input {name} was not in the enumerated device list; selecting a device will set it."
+            )),
+            Ok(_) => None,
+        };
+        match run_program_output("pactl", &["get-source-volume", &initial_input_name]) {
+            Ok(volume_text) => {
+                if let Some(volume) = parse_audio_channel_volumes(&volume_text)
+                    .iter()
+                    .copied()
+                    .reduce(f64::max)
+                {
+                    input_volume.set_value(volume);
+                } else {
+                    input_initial_status =
+                        Some("The audio server did not report microphone volume channels.".into());
+                }
+            }
+            Err(error) => {
+                input_initial_status = Some(format!("Could not read microphone level: {error}"));
+            }
+        }
+        input_card.append(&settings_control_row("Microphone level", &input_volume));
+
+        let input_muted_result =
+            run_program_output("pactl", &["get-source-mute", &initial_input_name]);
+        let input_muted = input_muted_result
+            .as_ref()
+            .is_ok_and(|result| result.trim() == "Mute: yes");
+        if let Err(error) = &input_muted_result {
+            input_initial_status = Some(format!("Could not read microphone mute state: {error}"));
+        }
+        let mute_switch = Switch::new();
+        mute_switch.set_active(input_muted);
+        input_card.append(&settings_control_row("Mute microphone", &mute_switch));
+
+        let input_initial_status = input_initial_status
+            .unwrap_or_else(|| "Changes are applied through the active audio server.".into());
+        let input_status = Label::new(Some(&input_initial_status));
+        input_status.add_css_class("cc-sub");
+        input_status.set_halign(Align::Start);
+        input_status.set_wrap(true);
+        input_card.append(&input_status);
+
+        let active_input = Rc::new(RefCell::new(initial_input_name));
+        let input_for_volume = active_input.clone();
+        let input_status_for_volume = input_status.clone();
+        input_volume.connect_value_changed(move |slider| {
+            let name = input_for_volume.borrow().clone();
+            match run_program_output(
+                "pactl",
+                &[
+                    "set-source-volume",
+                    &name,
+                    &format!("{:.0}%", slider.value()),
+                ],
+            ) {
+                Ok(_) => input_status_for_volume.set_text("Microphone level applied."),
+                Err(error) => input_status_for_volume
+                    .set_text(&format!("Could not set microphone level: {error}")),
+            }
+        });
+
+        let input_for_mute = active_input.clone();
+        let input_status_for_mute = input_status.clone();
+        mute_switch.connect_active_notify(move |switch| {
+            let name = input_for_mute.borrow().clone();
+            let value = if switch.is_active() { "1" } else { "0" };
+            match run_program_output("pactl", &["set-source-mute", &name, value]) {
+                Ok(_) => input_status_for_mute.set_text(if switch.is_active() {
+                    "Microphone muted."
+                } else {
+                    "Microphone unmuted."
+                }),
+                Err(error) => input_status_for_mute
+                    .set_text(&format!("Could not change microphone mute: {error}")),
+            }
+        });
+
+        let devices_for_select = input_devices;
+        let active_for_select = active_input.clone();
+        let volume_for_select = input_volume.clone();
+        let mute_for_select = mute_switch.clone();
+        let status_for_select = input_status.clone();
+        input_dropdown.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected() as usize;
+            let Some(device) = devices_for_select.get(selected) else {
+                return;
+            };
+            match run_program_output("pactl", &["set-default-source", &device.name]) {
+                Ok(_) => {
+                    active_for_select.replace(device.name.clone());
+                    if let Ok(volume_text) =
+                        run_program_output("pactl", &["get-source-volume", &device.name])
+                    {
+                        if let Some(volume) = parse_audio_channel_volumes(&volume_text)
+                            .iter()
+                            .copied()
+                            .reduce(f64::max)
+                        {
+                            volume_for_select.set_value(volume);
+                        }
+                    }
+                    let mute_result =
+                        run_program_output("pactl", &["get-source-mute", &device.name]);
+                    match mute_result {
+                        Ok(result) => {
+                            mute_for_select.set_active(result.trim() == "Mute: yes");
+                            status_for_select.set_text("Default input changed.");
+                        }
+                        Err(error) => status_for_select.set_text(&format!(
+                            "Default input changed, but mute state could not be read: {error}"
+                        )),
+                    }
+                }
+                Err(error) => {
+                    status_for_select.set_text(&format!("Could not select default input: {error}"))
+                }
+            }
+        });
+        page.append(&input_card);
+    }
+
+    add_settings_tool(page, "Open audio mixer", "pavucontrol", &[]);
+}
+
+fn append_battery_settings(page: &GtkBox) {
+    let (capacity, state) = read_battery_info();
+    page.append(&settings_card(
+        "Battery",
+        &format!("Charge: {capacity} · State: {state}"),
+    ));
+
+    let (health, cycles) = read_battery_health();
+    page.append(&settings_card(
+        "Battery Health",
+        &format!(
+            "Maximum capacity: {}\nCycle count: {}",
+            health.unwrap_or_else(|| "Not reported by hardware".to_string()),
+            cycles.unwrap_or_else(|| "Not reported by hardware".to_string())
+        ),
+    ));
+
+    match read_battery_history() {
+        Ok(mut history) if !history.is_empty() => {
+            history.sort_by_key(|sample| sample.timestamp);
+            let card = settings_card(
+                "Charge history",
+                "UPower-reported battery charge samples from the last 24 hours.",
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let sample_count = history.len().min(12);
+            for sample_index in 0..sample_count {
+                let history_index = if sample_count == 1 {
+                    history.len() - 1
+                } else {
+                    sample_index * (history.len() - 1) / (sample_count - 1)
+                };
+                let sample = &history[history_index];
+                let hours_ago = now.saturating_sub(sample.timestamp) / 3600;
+                let state = match sample.state {
+                    1 => "charging",
+                    2 => "discharging",
+                    3 => "empty",
+                    4 => "fully charged",
+                    5 => "charge pending",
+                    6 => "discharge pending",
+                    _ => "state unavailable",
+                };
+                let bar = ProgressBar::new();
+                bar.set_fraction(sample.percentage / 100.0);
+                bar.set_show_text(true);
+                bar.set_text(Some(&format!(
+                    "{hours_ago}h ago · {:.0}% · {state}",
+                    sample.percentage
+                )));
+                card.append(&bar);
+            }
+            page.append(&card);
+        }
+        Ok(_) => add_settings_integration_note(
+            page,
+            "Charge history unavailable",
+            "UPower reported no stored battery history samples.",
+        ),
+        Err(error) => add_settings_integration_note(
+            page,
+            "Charge history unavailable",
+            &format!("Could not read history from UPower: {error}"),
+        ),
+    }
+
+    match run_program_output("powerprofilesctl", &["list"]) {
+        Ok(output) => {
+            let profiles = parse_power_profiles(&output);
+            if profiles.is_empty() {
+                add_settings_integration_note(
+                    page,
+                    "Power modes unavailable",
+                    "The power service did not report any selectable profiles.",
+                );
+            } else {
+                let current_result = run_program_output("powerprofilesctl", &["get"]);
+                let current = current_result.as_ref().ok().cloned();
+                let current_index = current
+                    .as_ref()
+                    .and_then(|current| profiles.iter().position(|profile| profile == current))
+                    .unwrap_or(0);
+                let profile_dropdown = DropDown::from_strings(
+                    &profiles.iter().map(String::as_str).collect::<Vec<_>>(),
+                );
+                profile_dropdown.set_selected(current_index as u32);
+                let card = settings_card(
+                    "Power mode",
+                    "Set a mode supported by the host power-profiles service.",
+                );
+                card.append(&settings_control_row("Profile", &profile_dropdown));
+                let profile_status = match current_result {
+                    Ok(profile) if profiles.iter().any(|available| available == &profile) => {
+                        format!("Current profile: {profile}")
+                    }
+                    Ok(profile) => format!(
+                        "Current profile {profile} is not in the service's reported profile list."
+                    ),
+                    Err(error) => format!("Could not read the current power profile: {error}"),
+                };
+                let status = Label::new(Some(&profile_status));
+                status.add_css_class("cc-sub");
+                status.set_halign(Align::Start);
+                card.append(&status);
+
+                let profiles_for_select = profiles;
+                let status_for_select = status.clone();
+                profile_dropdown.connect_selected_notify(move |dropdown| {
+                    let selected = dropdown.selected() as usize;
+                    let Some(profile) = profiles_for_select.get(selected) else {
+                        return;
+                    };
+                    match run_program_output("powerprofilesctl", &["set", profile]) {
+                        Ok(_) => {
+                            status_for_select.set_text(&format!("Power profile set to {profile}."))
+                        }
+                        Err(error) => status_for_select
+                            .set_text(&format!("Could not set power profile: {error}")),
+                    }
+                });
+                page.append(&card);
+            }
+        }
+        Err(error) => add_settings_integration_note(
+            page,
+            "Power modes unavailable",
+            &format!("power-profiles-daemon is not available: {error}"),
+        ),
+    }
+
+    add_settings_tool(
+        page,
+        "Open power settings",
+        "gnome-control-center",
+        &["power"],
+    );
+}
+
 fn settings_search_matches(query: &str, searchable_text: &str) -> bool {
     let normalized_query = query
         .trim()
@@ -1588,6 +2833,134 @@ fn add_settings_tool(
     row.append(&button);
     row.append(&status);
     page.append(&row);
+}
+
+fn append_host_integration_diagnostics(page: &GtkBox) {
+    let portal_config_path = Path::new("/usr/share/xdg-desktop-portal/march-scara-portals.conf");
+    let portal_config = std::fs::read_to_string(portal_config_path);
+    let mut portal_status = Vec::new();
+    for (name, implementation, public_interface) in [
+        (
+            "File chooser",
+            "org.freedesktop.impl.portal.FileChooser",
+            "org.freedesktop.portal.FileChooser",
+        ),
+        (
+            "Portal settings",
+            "org.freedesktop.impl.portal.Settings",
+            "org.freedesktop.portal.Settings",
+        ),
+        (
+            "Screenshot",
+            "org.freedesktop.impl.portal.Screenshot",
+            "org.freedesktop.portal.Screenshot",
+        ),
+        (
+            "Screen sharing",
+            "org.freedesktop.impl.portal.ScreenCast",
+            "org.freedesktop.portal.ScreenCast",
+        ),
+    ] {
+        let result = match &portal_config {
+            Ok(contents) => match configured_portal_backend(contents, implementation) {
+                Some(backend) => {
+                    portal_backend_implements(backend, implementation).and_then(|()| {
+                        dbus_interface_available(
+                            "--user",
+                            "org.freedesktop.portal.Desktop",
+                            "/org/freedesktop/portal/desktop",
+                            public_interface,
+                        )
+                        .map(|()| format!("{name}: {backend} backend available"))
+                    })
+                }
+                None => Err(format!("No backend is configured for {implementation}.")),
+            },
+            Err(error) => Err(format!(
+                "Could not read {}: {error}",
+                portal_config_path.display()
+            )),
+        };
+        portal_status.push(match result {
+            Ok(status) => status,
+            Err(error) => format!("{name}: unavailable — {error}"),
+        });
+    }
+    page.append(&settings_card(
+        "XDG Desktop Portal backends",
+        &portal_status.join("\n"),
+    ));
+
+    let permission_store_status = dbus_interface_available(
+        "--user",
+        "org.freedesktop.impl.portal.PermissionStore",
+        "/org/freedesktop/impl/portal/PermissionStore",
+        "org.freedesktop.impl.portal.PermissionStore",
+    )
+    .map(|()| {
+        "PermissionStore API is available. App access requests remain owned by the portals."
+            .to_string()
+    })
+    .unwrap_or_else(|error| {
+        format!("PermissionStore unavailable; check xdg-desktop-portal: {error}")
+    });
+    let polkit_status = dbus_interface_available(
+        "--system",
+        "org.freedesktop.PolicyKit1",
+        "/org/freedesktop/PolicyKit1/Authority",
+        "org.freedesktop.PolicyKit1.Authority",
+    )
+    .map(|()| "Polkit authorization service is available.".to_string())
+    .unwrap_or_else(|error| format!("Polkit service unavailable: {error}"));
+    let agent_path = Path::new("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1");
+    let agent_status = if agent_path.is_file() {
+        format!(
+            "Polkit authentication agent found at {}.",
+            agent_path.display()
+        )
+    } else {
+        "Polkit authentication agent missing; install polkit-gnome.".to_string()
+    };
+    page.append(&settings_card(
+        "Permission storage and administrator authorization",
+        &format!("{permission_store_status}\n{polkit_status}\n{agent_status}\nMARCH SCARA does not request, store, or forward administrator passwords."),
+    ));
+
+    let utilities = [
+        (
+            "GNOME Control Center",
+            "gnome-control-center",
+            "gnome-control-center",
+        ),
+        ("NetworkManager CLI", "nmcli", "networkmanager"),
+        ("Bluetooth CLI", "bluetoothctl", "bluez-utils"),
+        ("PipeWire PulseAudio client", "pactl", "pipewire-pulse"),
+        (
+            "Power profile controls",
+            "powerprofilesctl",
+            "power-profiles-daemon",
+        ),
+        ("Credential manager", "seahorse", "seahorse"),
+        (
+            "Printer settings",
+            "system-config-printer",
+            "system-config-printer",
+        ),
+    ];
+    let utility_status = utilities
+        .iter()
+        .map(
+            |(name, program, package)| match find_program_on_path(program) {
+                Some(path) => format!("{name}: available ({})", path.display()),
+                None => format!("{name}: missing; install package {package}."),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    page.append(&settings_card(
+        "GNOME and system utilities",
+        &utility_status,
+    ));
 }
 
 fn persist_settings_change(
@@ -1803,7 +3176,7 @@ fn build_settings_window(
                 (
                     "sound",
                     "Sound",
-                    "Control output volume and open the audio mixer.",
+                    "Choose audio devices and control output, balance, and microphone level.",
                     "audio sound speaker microphone volume balance",
                 ),
                 (
@@ -1815,7 +3188,7 @@ fn build_settings_window(
                 (
                     "battery",
                     "Battery",
-                    "Review battery status and power-management tools.",
+                    "Review reported battery history and supported power modes.",
                     "battery power energy low power charging",
                 ),
                 (
@@ -2085,44 +3458,8 @@ fn build_settings_window(
                     refresh_bluetooth_devices(&devices_list, &devices_status);
                     page.append(&devices_card);
                 }
-                "sound" => {
-                    let card = settings_card("Output volume", "Adjust the default audio output.");
-                    let slider = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-                    if let Ok(volume) = run_cmd_output("pamixer --get-volume").parse::<f64>() {
-                        slider.set_value(volume);
-                    }
-                    slider.connect_value_changed(|scale| {
-                        launch_app(&format!(
-                            "pamixer --set-volume {}",
-                            scale.value().round() as u32
-                        ));
-                    });
-                    card.append(&slider);
-                    page.append(&card);
-                    add_settings_tool(&page, "Open audio mixer", "pavucontrol", &[]);
-                }
-                "battery" => {
-                    let (capacity, state) = read_battery_info();
-                    page.append(&settings_card(
-                        "Battery",
-                        &format!("Charge: {capacity} · State: {state}"),
-                    ));
-                    let (health, cycles) = read_battery_health();
-                    page.append(&settings_card(
-                        "Battery Health",
-                        &format!(
-                            "Maximum capacity: {}\nCycle count: {}",
-                            health.unwrap_or_else(|| "Not reported by hardware".to_string()),
-                            cycles.unwrap_or_else(|| "Not reported by hardware".to_string())
-                        ),
-                    ));
-                    add_settings_tool(
-                        &page,
-                        "Open power settings",
-                        "gnome-control-center",
-                        &["power"],
-                    );
-                }
+                "sound" => append_sound_settings(&page),
+                "battery" => append_battery_settings(&page),
                 "general" => {
                     let hostname = std::fs::read_to_string("/etc/hostname")
                         .map(|name| name.trim().to_string())
@@ -2187,43 +3524,103 @@ fn build_settings_window(
                             &format!("Usage data is unavailable: {error}"),
                         ),
                     }
+                    append_home_storage_categories(&page);
                     add_settings_tool(
                         &page,
                         "Open system information",
                         "gnome-control-center",
                         &["about"],
                     );
+                    add_settings_tool(
+                        &page,
+                        "Open software updates",
+                        "gnome-software",
+                        &[],
+                    );
+                    add_settings_tool(
+                        &page,
+                        "Open Date & Time settings",
+                        "gnome-control-center",
+                        &["datetime"],
+                    );
+                    add_settings_tool(
+                        &page,
+                        "Open Language & Region settings",
+                        "gnome-control-center",
+                        &["region"],
+                    );
                     add_settings_integration_note(
                         &page,
                         "Updates, storage, and startup items",
-                        "System update management, storage breakdowns, and login-item editing are not connected in this release.",
+                        "The storage view reports the root filesystem and standard home-folder sizes. Software updates and time/region preferences open host settings when installed. MARCH SCARA does not yet manage login items or categorize all application/system data.",
                     );
                 }
                 "keyboard" => {
-                    page.append(&settings_card(
+                    let shortcuts = settings_card(
                         "MARCH SCARA shortcuts",
-                        "Super+Return: terminal · Super+E: files · Super+Q: close · Super+1–5: workspaces · Super alone: app launcher.",
-                    ));
-                    add_settings_tool(
-                        &page,
-                        "Open keyboard settings",
-                        "gnome-control-center",
-                        &["keyboard"],
+                        "Super+Return: terminal · Super+E: files · Super+Q: close · Super+1–5: workspaces · Super+Shift+1–5: move window · Super alone: app launcher.",
                     );
+                    let shortcut_status = Label::new(Some(
+                        "Edit the user init.lua to customize bindings, then reload them here.",
+                    ));
+                    shortcut_status.add_css_class("cc-sub");
+                    shortcut_status.set_halign(Align::Start);
+                    shortcuts.append(&shortcut_status);
+                    let actions = GtkBox::new(Orientation::Horizontal, 8);
+                    let edit_shortcuts = Button::with_label("Edit shortcuts");
+                    edit_shortcuts.add_css_class("flat");
+                    edit_shortcuts.add_css_class("menu-action-btn");
+                    let shortcut_status_ref = shortcut_status.clone();
+                    edit_shortcuts.connect_clicked(move |_| {
+                        match open_user_config(
+                            "march-scara",
+                            "init.lua",
+                            include_str!("../../../data/init.lua"),
+                        ) {
+                            Ok(path) => shortcut_status_ref
+                                .set_text(&format!("Editing {}.", path.display())),
+                            Err(error) => shortcut_status_ref.set_text(&error),
+                        }
+                    });
+                    actions.append(&edit_shortcuts);
+                    let reload_shortcuts = Button::with_label("Reload shortcuts");
+                    reload_shortcuts.add_css_class("flat");
+                    reload_shortcuts.add_css_class("menu-action-btn");
+                    let shortcut_status_ref = shortcut_status.clone();
+                    reload_shortcuts.connect_clicked(move |_| {
+                        match run_wm_ctl_output("reload") {
+                            Ok(response) => shortcut_status_ref.set_text(&response),
+                            Err(error) => shortcut_status_ref
+                                .set_text(&format!("Could not reload shortcuts: {error}")),
+                        }
+                    });
+                    actions.append(&reload_shortcuts);
+                    shortcuts.append(&actions);
+                    page.append(&shortcuts);
+                    add_settings_integration_note(
+                        &page,
+                        "Keyboard input",
+                        "Key repeat and input-source changes are not currently exposed by the compositor. The host keyboard panel is available when installed.",
+                    );
+                    add_settings_tool(&page, "Open host keyboard settings", "gnome-control-center", &["keyboard"]);
                 }
                 "mouse" => {
-                    page.append(&settings_card(
-                        "Pointer",
-                        "Pointer settings are applied by libinput. Tap-to-click is enabled when supported by the device.",
-                    ));
+                    let pointer_summary = input_device_summary("pointer")
+                        .unwrap_or_else(|error| format!("Could not enumerate libinput devices: {error}"));
+                    page.append(&settings_card("Libinput pointer devices", &pointer_summary));
+                    add_settings_integration_note(
+                        &page,
+                        "Pointer settings",
+                        "This panel reports devices exposed by libinput. Per-device acceleration and button mappings are not yet configurable by MARCH SCARA.",
+                    );
                     add_settings_tool(
                         &page,
-                        "Open mouse settings",
+                        "Open host mouse settings",
                         "gnome-control-center",
                         &["mouse"],
                     );
                 }
-                "display" => add_settings_tool(&page, "Open display controls", "wdisplays", &[]),
+                "display" => append_display_output_cards(&page),
                 "appearance" => {
                     let card = settings_card(
                         "Personalize your desktop",
@@ -2343,12 +3740,21 @@ fn build_settings_window(
                     let status_ref = status.clone();
                     reduce_transparency.connect_active_notify(move |switch| {
                         let value = switch.is_active();
-                        persist_settings_change(
+                        if persist_settings_change(
                             &preferences_ref,
                             &window_ref,
                             &status_ref,
                             |settings| settings.reduce_transparency = value,
-                        );
+                        ) {
+                            match set_compositor_reduce_transparency(value) {
+                                Ok(()) => status_ref.set_text(
+                                    "Saved and applied to the compositor immediately.",
+                                ),
+                                Err(error) => status_ref.set_text(&format!(
+                                    "Preference saved, but compositor update failed: {error}"
+                                )),
+                            }
+                        }
                     });
                     add_settings_tool(
                         &page,
@@ -2376,7 +3782,7 @@ fn build_settings_window(
                     status.set_wrap(true);
 
                     let settings_window = window.clone();
-                    let wallpaper_picture = wallpaper_picture.clone();
+                    let chooser_wallpaper_picture = wallpaper_picture.clone();
                     let preferences_ref = preferences.clone();
                     let status_ref = status.clone();
                     choose_wallpaper.connect_clicked(move |_| {
@@ -2387,7 +3793,7 @@ fn build_settings_window(
                             Some("Select"),
                             Some("Cancel"),
                         );
-                        let picture = wallpaper_picture.clone();
+                        let picture = chooser_wallpaper_picture.clone();
                         let preferences = preferences_ref.clone();
                         let status = status_ref.clone();
                         chooser.connect_response(move |dialog, response| {
@@ -2431,6 +3837,80 @@ fn build_settings_window(
                     card.append(&choose_wallpaper);
                     card.append(&status);
                     page.append(&card);
+                    match discover_wallpapers() {
+                        Ok(wallpapers) if !wallpapers.is_empty() => {
+                            let labels = wallpapers
+                                .iter()
+                                .map(|path| {
+                                    let directory = path
+                                        .parent()
+                                        .and_then(Path::file_name)
+                                        .map(|name| name.to_string_lossy())
+                                        .unwrap_or_default();
+                                    let file = path
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy())
+                                        .unwrap_or_default();
+                                    format!("{directory} · {file}")
+                                })
+                                .collect::<Vec<_>>();
+                            let gallery = settings_card(
+                                "Wallpaper gallery",
+                                "Images found in /usr/share/backgrounds and ~/Pictures/Wallpapers.",
+                            );
+                            let selection = DropDown::from_strings(
+                                &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+                            );
+                            gallery.append(&settings_control_row("Available image", &selection));
+                            let gallery_status = Label::new(Some(""));
+                            gallery_status.add_css_class("cc-sub");
+                            gallery_status.set_halign(Align::Start);
+                            let apply = Button::with_label("Apply selected wallpaper");
+                            apply.add_css_class("flat");
+                            apply.add_css_class("menu-action-btn");
+                            let gallery_paths = wallpapers;
+                            let selected_wallpaper = selection.clone();
+                            let gallery_picture = wallpaper_picture.clone();
+                            let gallery_preferences = preferences.clone();
+                            let gallery_status_ref = gallery_status.clone();
+                            apply.connect_clicked(move |_| {
+                                let Some(path) =
+                                    gallery_paths.get(selected_wallpaper.selected() as usize)
+                                else {
+                                    gallery_status_ref.set_text("Select a wallpaper first.");
+                                    return;
+                                };
+                                let Some(filename) = path.to_str() else {
+                                    gallery_status_ref
+                                        .set_text("The selected file path is not valid UTF-8.");
+                                    return;
+                                };
+                                match update_preferences(&gallery_preferences, |settings| {
+                                    settings.wallpaper = Some(path.clone());
+                                }) {
+                                    Ok(()) => {
+                                        gallery_picture.set_filename(Some(filename));
+                                        gallery_status_ref.set_text("Wallpaper updated and saved.");
+                                    }
+                                    Err(error) => gallery_status_ref
+                                        .set_text(&format!("Could not save wallpaper setting: {error}")),
+                                }
+                            });
+                            gallery.append(&apply);
+                            gallery.append(&gallery_status);
+                            page.append(&gallery);
+                        }
+                        Ok(_) => add_settings_integration_note(
+                            &page,
+                            "Wallpaper gallery",
+                            "No system or user wallpaper images were found. You can still choose an image file above.",
+                        ),
+                        Err(error) => add_settings_integration_note(
+                            &page,
+                            "Wallpaper gallery unavailable",
+                            &error,
+                        ),
+                    }
                     add_settings_integration_note(
                         &page,
                         "Screen saver",
@@ -2448,11 +3928,87 @@ fn build_settings_window(
                         "Notifications",
                         "Mako is started with the MARCH SCARA session and receives standard Wayland desktop notifications.",
                     ));
-                    add_settings_integration_note(
-                        &page,
-                        "Notification preferences & Focus",
-                        "Per-application rules, schedules, and Do Not Disturb controls are not yet exposed in MARCH SCARA Settings.",
+                    let focus_card = settings_card(
+                        "Focus",
+                        "Toggle Mako's Do Not Disturb mode for this session.",
                     );
+                    let focus_status_text = match mako_focus_status() {
+                        Ok(true) => "Do Not Disturb is active.".to_string(),
+                        Ok(false) => "Do Not Disturb is inactive.".to_string(),
+                        Err(error) => format!("Mako control is unavailable: {error}"),
+                    };
+                    let focus_status = Label::new(Some(&focus_status_text));
+                    focus_status.add_css_class("cc-sub");
+                    focus_status.set_halign(Align::Start);
+                    focus_card.append(&focus_status);
+                    let focus_button = Button::with_label("Toggle Do Not Disturb");
+                    focus_button.add_css_class("flat");
+                    focus_button.add_css_class("menu-action-btn");
+                    let focus_status_ref = focus_status.clone();
+                    focus_button.connect_clicked(move |_| {
+                        match run_program_output(
+                            "makoctl",
+                            &["mode", "-t", "do-not-disturb"],
+                        ) {
+                            Ok(_) => match mako_focus_status() {
+                                Ok(true) => focus_status_ref.set_text("Do Not Disturb is active."),
+                                Ok(false) => {
+                                    focus_status_ref.set_text("Do Not Disturb is inactive.")
+                                }
+                                Err(error) => focus_status_ref.set_text(&format!(
+                                    "Mode changed, but Mako status could not be read: {error}"
+                                )),
+                            },
+                            Err(error) => focus_status_ref
+                                .set_text(&format!("Could not toggle Focus mode: {error}")),
+                        }
+                    });
+                    focus_card.append(&focus_button);
+                    page.append(&focus_card);
+
+                    let rules_card = settings_card(
+                        "Per-application notification rules",
+                        "Edit Mako's user configuration to persist app-specific notification rules. Reload after saving.",
+                    );
+                    let rules_status = Label::new(Some(
+                        "Rules are stored in the user's Mako configuration and owned by Mako.",
+                    ));
+                    rules_status.add_css_class("cc-sub");
+                    rules_status.set_halign(Align::Start);
+                    rules_status.set_wrap(true);
+                    rules_card.append(&rules_status);
+                    let rules_actions = GtkBox::new(Orientation::Horizontal, 8);
+                    let edit_rules = Button::with_label("Edit notification rules");
+                    edit_rules.add_css_class("flat");
+                    edit_rules.add_css_class("menu-action-btn");
+                    let rules_status_ref = rules_status.clone();
+                    edit_rules.connect_clicked(move |_| {
+                        match open_user_config(
+                            "mako",
+                            "config",
+                            "# Per-application Mako rules can be added here.\n",
+                        ) {
+                            Ok(path) => {
+                                rules_status_ref.set_text(&format!("Editing {}.", path.display()))
+                            }
+                            Err(error) => rules_status_ref.set_text(&error),
+                        }
+                    });
+                    rules_actions.append(&edit_rules);
+                    let reload_rules = Button::with_label("Reload rules");
+                    reload_rules.add_css_class("flat");
+                    reload_rules.add_css_class("menu-action-btn");
+                    let rules_status_ref = rules_status.clone();
+                    reload_rules.connect_clicked(move |_| {
+                        match run_program_output("makoctl", &["reload"]) {
+                            Ok(_) => rules_status_ref.set_text("Mako notification rules reloaded."),
+                            Err(error) => rules_status_ref
+                                .set_text(&format!("Could not reload Mako rules: {error}")),
+                        }
+                    });
+                    rules_actions.append(&reload_rules);
+                    rules_card.append(&rules_actions);
+                    page.append(&rules_card);
                 }
                 "accessibility" => {
                     let card = settings_card(
@@ -2474,12 +4030,21 @@ fn build_settings_window(
                     let status_ref = status.clone();
                     reduce_transparency.connect_active_notify(move |switch| {
                         let value = switch.is_active();
-                        persist_settings_change(
+                        if persist_settings_change(
                             &preferences_ref,
                             &window_ref,
                             &status_ref,
                             |settings| settings.reduce_transparency = value,
-                        );
+                        ) {
+                            match set_compositor_reduce_transparency(value) {
+                                Ok(()) => status_ref.set_text(
+                                    "Saved and applied to the compositor immediately.",
+                                ),
+                                Err(error) => status_ref.set_text(&format!(
+                                    "Preference saved, but compositor update failed: {error}"
+                                )),
+                            }
+                        }
                     });
                     page.append(&card);
                     add_settings_tool(
@@ -2490,16 +4055,15 @@ fn build_settings_window(
                     );
                 }
                 "privacy" => {
-                    add_settings_integration_note(
-                        &page,
+                    page.append(&settings_card(
                         "Application permissions",
-                        "Use the host desktop's privacy controls and XDG Desktop Portal permission prompts. MARCH SCARA does not maintain a separate permission database.",
-                    );
-                    add_settings_integration_note(
-                        &page,
+                        "File and wallpaper/avatar selection use GTK native choosers with GTK_USE_PORTAL enabled. Supported app access prompts and remembered permissions are handled by XDG Desktop Portal; MARCH SCARA does not keep a parallel permission database or edit another app's permissions.",
+                    ));
+                    page.append(&settings_card(
                         "Administrator actions",
-                        "System tools should request authorization through Polkit. MARCH SCARA does not collect or store administrator passwords.",
-                    );
+                        "NetworkManager, BlueZ, power-profile, and other host services perform privileged changes. Polkit handles authorization; MARCH SCARA never requests or stores administrator passwords.",
+                    ));
+                    append_host_integration_diagnostics(&page);
                     add_settings_tool(
                         &page,
                         "Open GNOME privacy settings",
@@ -2714,31 +4278,64 @@ fn build_settings_window(
                     "Lock screen",
                     "Lock-screen messages, idle timers, and sleep authentication are managed by the host system, not MARCH SCARA.",
                 ),
-                "passwords" => add_settings_tool(
-                    &page,
-                    "Open password manager",
-                    "seahorse",
-                    &[],
-                ),
+                "passwords" => {
+                    let secret_service_status = secret_service_status(|| {
+                        dbus_interface_available(
+                            "--user",
+                            "org.freedesktop.secrets",
+                            "/org/freedesktop/secrets",
+                            "org.freedesktop.Secret.Service",
+                        )
+                    });
+                    page.append(&settings_card(
+                        "System credential service",
+                        &secret_service_status,
+                    ));
+                    add_settings_tool(&page, "Open password manager", "seahorse", &[]);
+                }
                 "trackpad" => {
+                    let touchpad_summary = input_device_summary("touchpad")
+                        .unwrap_or_else(|error| format!("Could not enumerate libinput devices: {error}"));
+                    page.append(&settings_card("Libinput touchpad devices", &touchpad_summary));
                     add_settings_integration_note(
                         &page,
-                        "Trackpad gestures",
-                        "Gesture configuration is currently managed by the system input stack.",
+                        "Trackpad settings",
+                        "The compositor enables tap-to-click on supported devices. Natural scrolling, pointer speed, and gesture configuration are not yet configurable here.",
                     );
                     add_settings_tool(
                         &page,
-                        "Open touchpad settings",
+                        "Open host touchpad settings",
                         "gnome-control-center",
                         &["mouse"],
                     );
                 }
-                "printers" => add_settings_tool(
-                    &page,
-                    "Open printer settings",
-                    "system-config-printer",
-                    &[],
-                ),
+                "printers" => {
+                    let status = Label::new(Some("Checking CUPS printers and queues…"));
+                    status.add_css_class("cc-sub");
+                    status.set_halign(Align::Start);
+                    status.set_wrap(true);
+                    let card = settings_card(
+                        "CUPS printers and queues",
+                        "Read-only status from the host print service. Adding or removing printers remains a host-authorized action.",
+                    );
+                    card.append(&status);
+                    let refresh = Button::with_label("Refresh printers and queue");
+                    refresh.add_css_class("flat");
+                    refresh.add_css_class("menu-action-btn");
+                    let status_ref = status.clone();
+                    refresh.connect_clicked(move |_| {
+                        refresh_printer_status(&status_ref);
+                    });
+                    card.append(&refresh);
+                    page.append(&card);
+                    refresh_printer_status(&status);
+                    add_settings_tool(
+                        &page,
+                        "Open printer settings",
+                        "system-config-printer",
+                        &[],
+                    );
+                }
                 "multitasking" => page.append(&settings_card(
                     "Workspaces and windows",
                     "Use Super+1–5 to switch workspaces, Super+Shift+1–5 to move a window, Super+F to toggle floating, and Super+T to toggle layout.",
@@ -2944,9 +4541,13 @@ fn build_settings_window(
 #[cfg(test)]
 mod settings_search_tests {
     use super::{
-        battery_health_percentage, clock_format_string, launcher_entry_matches,
-        menu_bar_module_visible, parse_bluetooth_devices, parse_bluetooth_powered,
-        parse_storage_row, parse_wifi_networks, parse_wifi_profiles, settings_panel_from_uri,
+        audio_balance_from_volumes, battery_health_percentage, clock_format_string,
+        configured_portal_backend, dbus_interface_available_with, launcher_entry_matches,
+        mako_focus_status_with, menu_bar_module_visible, notification_mode_active,
+        parse_audio_channel_volumes, parse_audio_devices, parse_battery_history,
+        parse_bluetooth_devices, parse_bluetooth_powered, parse_libinput_device_summary,
+        parse_power_profiles, parse_storage_row, parse_wifi_networks, parse_wifi_profiles,
+        printer_status_with, secret_service_status, settings_panel_from_uri,
         settings_search_matches, update_menu_bar_module, DesktopApp,
     };
     use crate::preferences::UserPreferences;
@@ -3005,6 +4606,17 @@ mod settings_search_tests {
             settings_panel_from_uri("mactahoe://settings/assistant"),
             None
         );
+    }
+
+    #[test]
+    fn desktop_entry_registers_uri_launch_argument() {
+        let desktop_entry = include_str!("../../../data/march-scara-settings-handler.desktop");
+        assert!(desktop_entry
+            .lines()
+            .any(|line| line == "Exec=/usr/bin/scara-shell %u"));
+        assert!(desktop_entry
+            .lines()
+            .any(|line| line == "MimeType=x-scheme-handler/mactahoe;"));
     }
 
     #[test]
@@ -3076,6 +4688,166 @@ mod settings_search_tests {
         assert_eq!(parse_bluetooth_powered("Powered: yes\n"), Some(true));
         assert_eq!(parse_bluetooth_powered("Powered: no\n"), Some(false));
         assert_eq!(parse_bluetooth_powered("No controller available"), None);
+    }
+
+    #[test]
+    fn audio_device_parser_excludes_monitor_sources() {
+        let sources = parse_audio_devices(
+            "42\talsa_input.usb-microphone\tmodule\t...\tRUNNING\n43\talsa_output.monitor\tmodule\t...\tIDLE",
+            false,
+        );
+        assert_eq!(
+            sources,
+            vec![super::AudioDevice {
+                name: "alsa_input.usb-microphone".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn audio_balance_uses_stereo_channel_volumes_only() {
+        let volumes = parse_audio_channel_volumes(
+            "Volume: front-left: 65536 / 80% / -1.94 dB, front-right: 65536 / 100% / 0.00 dB",
+        );
+        assert_eq!(volumes, vec![80.0, 100.0]);
+        assert_eq!(audio_balance_from_volumes(&volumes), Some(20.0));
+        assert_eq!(audio_balance_from_volumes(&[100.0]), None);
+    }
+
+    #[test]
+    fn upower_history_parser_checks_declared_sample_count() {
+        let history = parse_battery_history("a(udu) 2 1700000000 79.5 2 1700003600 81 1")
+            .expect("valid UPower history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].percentage, 79.5);
+        assert_eq!(history[0].state, 2);
+        assert!(parse_battery_history("a(udu) 2 1700000000 79.5 2").is_err());
+    }
+
+    #[test]
+    fn power_profile_parser_ignores_profile_details() {
+        assert_eq!(
+            parse_power_profiles(
+                "performance:\n  CpuDriver: intel_pstate\n* balanced:\n  PlatformDriver: platform_profile\npower-saver:\n"
+            ),
+            vec!["performance", "balanced", "power-saver"]
+        );
+    }
+
+    #[test]
+    fn march_portal_configuration_routes_interfaces_to_supported_backends() {
+        let configuration = include_str!("../../../data/march-scara-portals.conf");
+        assert_eq!(
+            configured_portal_backend(configuration, "org.freedesktop.impl.portal.ScreenCast"),
+            Some("wlr")
+        );
+        assert_eq!(
+            configured_portal_backend(configuration, "org.freedesktop.impl.portal.Screenshot"),
+            Some("wlr")
+        );
+        assert_eq!(
+            configured_portal_backend(configuration, "org.freedesktop.impl.portal.FileChooser"),
+            Some("gtk")
+        );
+        assert_eq!(
+            configured_portal_backend(configuration, "org.freedesktop.impl.portal.Settings"),
+            Some("gtk")
+        );
+    }
+
+    #[test]
+    fn mako_focus_mode_is_detected_from_active_modes() {
+        assert!(notification_mode_active(
+            "do-not-disturb\npresentation",
+            "do-not-disturb"
+        ));
+        assert!(!notification_mode_active(
+            "presentation\n",
+            "do-not-disturb"
+        ));
+        assert!(!notification_mode_active(
+            "not-do-not-disturb",
+            "do-not-disturb"
+        ));
+    }
+
+    #[test]
+    fn mako_status_and_bus_permission_failures_are_reported() {
+        assert_eq!(
+            mako_focus_status_with(|_, _| Err("Access denied".to_string())),
+            Err("Access denied".to_string())
+        );
+        let status = secret_service_status(|| Err("Access denied".to_string()));
+        assert!(status.contains("Access denied"));
+    }
+
+    #[test]
+    fn dbus_service_probe_uses_requested_bus_and_surfaces_denial() {
+        let result = dbus_interface_available_with(
+            "--user",
+            "org.freedesktop.secrets",
+            "/org/freedesktop/secrets",
+            "org.freedesktop.Secret.Service",
+            |program, args| {
+                assert_eq!(program, "busctl");
+                assert_eq!(
+                    args,
+                    [
+                        "--user",
+                        "introspect",
+                        "org.freedesktop.secrets",
+                        "/org/freedesktop/secrets",
+                        "org.freedesktop.Secret.Service"
+                    ]
+                );
+                Err("Access denied".to_string())
+            },
+        );
+        assert_eq!(result, Err("Access denied".to_string()));
+    }
+
+    #[test]
+    fn cups_service_status_includes_printers_default_and_queue() {
+        let status = printer_status_with(|program, args| {
+            assert_eq!(program, "lpstat");
+            match args {
+                ["-p"] => Ok("printer Office is idle. enabled since today".to_string()),
+                ["-d"] => Ok("system default destination: Office".to_string()),
+                ["-o"] => Ok("Office-17 user 1024 bytes".to_string()),
+                _ => Err("Unexpected lpstat arguments".to_string()),
+            }
+        })
+        .expect("CUPS status should be combined");
+        assert!(status.contains("printer Office"));
+        assert!(status.contains("default destination: Office"));
+        assert!(status.contains("Office-17"));
+    }
+
+    #[test]
+    fn cups_permission_errors_are_not_misreported_as_empty_queues() {
+        let result = printer_status_with(|_, args| {
+            if args == ["-p"] {
+                Err("Not authorized to query print service".to_string())
+            } else {
+                Ok(String::new())
+            }
+        });
+        assert_eq!(
+            result,
+            Err("Not authorized to query print service".to_string())
+        );
+    }
+
+    #[test]
+    fn libinput_device_listing_filters_pointer_and_touchpad_devices() {
+        let output = "Device: USB Mouse\nKernel: /dev/input/event1\nCapabilities: pointer\n\nDevice: ELAN Touchpad\nKernel: /dev/input/event2\nCapabilities: pointer\nTap-to-click: enabled\n";
+        let pointers = parse_libinput_device_summary(output, "pointer");
+        assert!(pointers.contains("USB Mouse"));
+        assert!(!pointers.contains("ELAN Touchpad"));
+        let touchpads = parse_libinput_device_summary(output, "touchpad");
+        assert!(touchpads.contains("ELAN Touchpad"));
+        assert!(touchpads.contains("Tap-to-click: enabled"));
+        assert!(!touchpads.contains("USB Mouse"));
     }
 
     #[test]
@@ -4233,6 +6005,15 @@ fn main() -> glib::ExitCode {
             Ok(preferences) => (preferences, None),
             Err(error) => (UserPreferences::default(), Some(error.to_string())),
         };
+        let is_march_session = std::env::var("XDG_CURRENT_DESKTOP")
+            .is_ok_and(|desktop| desktop.split(':').any(|name| name == "MARCH-SCARA"));
+        if is_march_session {
+            if let Err(error) =
+                set_compositor_reduce_transparency(initial_preferences.reduce_transparency)
+            {
+                eprintln!("Could not restore compositor transparency preference: {error}");
+            }
+        }
         let preferences = Rc::new(RefCell::new(initial_preferences));
         let menu_bar_widgets = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let (settings_window, navigator) = build_settings_window(

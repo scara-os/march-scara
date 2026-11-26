@@ -1,5 +1,6 @@
 #![allow(irrefutable_let_patterns)]
 
+mod display;
 mod drm;
 mod glass_renderer;
 mod grabs;
@@ -12,7 +13,7 @@ mod winit;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use smithay::backend::session::{libseat::LibSeatSession, Session};
 use smithay::reexports::{
@@ -26,6 +27,7 @@ pub struct CalloopData {
     state: Smallvil,
     display_handle: DisplayHandle,
     drm_backend: Option<drm::DrmBackend>,
+    winit_display_tx: Option<mpsc::Sender<display::DisplayIpcRequest>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut event_loop: EventLoop<CalloopData> = EventLoop::try_new()?;
     let (ipc_tx, ipc_rx) = channel::channel::<String>();
+    let (display_tx, display_rx) = channel::channel::<display::DisplayIpcRequest>();
 
     // Terima aksi jendela dari scara-ctl / scara-shell secara real-time di main loop
     event_loop
@@ -64,6 +67,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .insert_source(ipc_rx, |event, _, data| {
             if let channel::Event::Msg(action) = event {
                 data.state.execute_action(&action);
+            }
+        })?;
+
+    event_loop
+        .handle()
+        .insert_source(display_rx, |event, _, data| {
+            let channel::Event::Msg(request) = event else {
+                return;
+            };
+            if let Some(backend) = data.drm_backend.as_mut() {
+                let result = backend.handle_display_request(&request.command, &mut data.state);
+                let _ = request.reply.send(result);
+            } else if let Some(sender) = &data.winit_display_tx {
+                if let Err(error) = sender.send(request) {
+                    let _ = error
+                        .0
+                        .reply
+                        .send("ERROR: Winit display handler stopped.".into());
+                }
+            } else {
+                let _ = request
+                    .reply
+                    .send("ERROR: No display backend is available.".into());
             }
         })?;
 
@@ -75,17 +101,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg_for_ipc = Arc::clone(&config);
     std::thread::spawn(move || {
-        for stream in ipc_listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let mut cmd = String::new();
-                stream.read_to_string(&mut cmd).ok();
-                let trimmed = cmd.trim();
-                let reply = match trimmed {
-                    "ping" => "PONG | MARCH SCARA Wayland Compositor Active".to_string(),
-                    "reload" => {
-                        let _ = ipc_tx.send("config:reload".to_string());
-                        "OK: Reloaded init.lua".to_string()
+        for connection in ipc_listener.incoming() {
+            let mut stream = match connection {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(%error, "Failed to accept compositor IPC connection");
+                    continue;
+                }
+            };
+            let mut cmd = String::new();
+            if let Err(error) = stream.read_to_string(&mut cmd) {
+                warn!(%error, "Failed to read compositor IPC request");
+                continue;
+            }
+            let trimmed = cmd.trim();
+            let reply = if trimmed.starts_with("display:") {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                match display_tx.send(display::DisplayIpcRequest {
+                    command: trimmed.to_string(),
+                    reply: reply_tx,
+                }) {
+                    Ok(()) => reply_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap_or_else(|error| {
+                            format!("ERROR: Display request did not complete: {error}")
+                        }),
+                    Err(error) => {
+                        format!("ERROR: Display request queue is unavailable: {error}")
                     }
+                }
+            } else {
+                match trimmed {
+                    "ping" => "PONG | MARCH SCARA Wayland Compositor Active".to_string(),
+                    "reload" => match ipc_tx.send("config:reload".to_string()) {
+                        Ok(()) => "OK: Reloaded init.lua".to_string(),
+                        Err(error) => {
+                            format!("ERROR: Could not queue configuration reload: {error}")
+                        }
+                    },
                     "config" => format!("{:?}", cfg_for_ipc.lock().unwrap()),
                     action
                         if action.starts_with("window:")
@@ -93,15 +146,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             || action.starts_with("layout:")
                             || action.starts_with("workspace:")
                             || action.starts_with("movetoworkspace:")
+                            || matches!(
+                                action,
+                                "appearance:reduce-transparency:on"
+                                    | "appearance:reduce-transparency:off"
+                            )
                             || action == "config:reload"
                             || action == "session:quit" =>
                     {
-                        let _ = ipc_tx.send(action.to_string());
-                        format!("OK: {}", action)
+                        match ipc_tx.send(action.to_string()) {
+                            Ok(()) => format!("OK: {}", action),
+                            Err(error) => format!("ERROR: Could not queue action: {error}"),
+                        }
                     }
                     other => format!("Perintah IPC diterima: {}", other),
-                };
-                stream.write_all(reply.as_bytes()).ok();
+                }
+            };
+            if let Err(error) = stream.write_all(reply.as_bytes()) {
+                warn!(%error, "Failed to send compositor IPC response");
             }
         }
     });
@@ -120,6 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state,
         display_handle,
         drm_backend: None,
+        winit_display_tx: None,
     };
 
     match session {
@@ -127,7 +190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drm::DrmBackend::initialize(&mut event_loop, &mut data, session, notifier)?;
         }
         None => {
-            crate::winit::init_winit(&mut event_loop, &mut data)?;
+            let (sender, receiver) = mpsc::channel();
+            data.winit_display_tx = Some(sender);
+            crate::winit::init_winit(&mut event_loop, &mut data, receiver)?;
         }
     }
 
@@ -157,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Ok(shell) = std::process::Command::new(dir.join("scara-shell"))
             .env("GSK_RENDERER", "gl")
+            .env("GTK_USE_PORTAL", "1")
             .spawn()
         {
             children.push(shell);

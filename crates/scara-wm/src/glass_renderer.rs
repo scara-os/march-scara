@@ -74,6 +74,14 @@ void main() {
 
 const LIQUID_GLASS_FRAG: &str = include_str!("../../../assets/shaders/liquid-glass.frag");
 
+fn glass_effect_parameters(reduce_transparency: bool, refraction: f32) -> (f32, [f32; 4]) {
+    if reduce_transparency {
+        (0.0, [0.20, 0.22, 0.28, 1.0])
+    } else {
+        (refraction, [0.16, 0.19, 0.30, 0.14])
+    }
+}
+
 pub struct GlassPipeline {
     blur_program: GlesTexProgram,
     glass_program: GlesTexProgram,
@@ -228,6 +236,7 @@ impl GlassPipeline {
         size: Size<i32, Physical>,
         refraction: f32,
         blur_passes: u32,
+        reduce_transparency: bool,
         cursor_location: Option<Point<i32, Physical>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.ensure_textures(renderer, size)?;
@@ -252,55 +261,57 @@ impl GlassPipeline {
         let src_rect_buf: Rectangle<f64, BufferCoord> =
             Rectangle::from_size((size.w as f64, size.h as f64).into());
 
-        let passes = blur_passes.clamp(1, 6);
-        for pass in 0..passes {
-            let spread = (pass + 1) as f32 * 1.35;
-            {
-                let src_tex = if pass == 0 {
-                    self.backdrop_tex.as_ref().unwrap()
-                } else {
-                    self.blur_tex_b.as_ref().unwrap()
-                };
-                let dst_tex = self.blur_tex_a.as_mut().unwrap();
-                let mut target = renderer.bind(dst_tex)?;
-                let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
-                frame.render_texture_from_to(
-                    src_tex,
-                    src_rect_buf,
-                    full_damage,
-                    &[full_damage],
-                    &[],
-                    Transform::Normal,
-                    1.0,
-                    Some(&self.blur_program),
-                    &[
-                        Uniform::new("u_texel_size", [texel_x * spread, texel_y * spread]),
-                        Uniform::new("u_blur_dir", [1.0, 0.0]),
-                    ],
-                )?;
-                let _ = frame.finish()?;
-            }
+        if !reduce_transparency {
+            let passes = blur_passes.clamp(1, 6);
+            for pass in 0..passes {
+                let spread = (pass + 1) as f32 * 1.35;
+                {
+                    let src_tex = if pass == 0 {
+                        self.backdrop_tex.as_ref().unwrap()
+                    } else {
+                        self.blur_tex_b.as_ref().unwrap()
+                    };
+                    let dst_tex = self.blur_tex_a.as_mut().unwrap();
+                    let mut target = renderer.bind(dst_tex)?;
+                    let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
+                    frame.render_texture_from_to(
+                        src_tex,
+                        src_rect_buf,
+                        full_damage,
+                        &[full_damage],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        Some(&self.blur_program),
+                        &[
+                            Uniform::new("u_texel_size", [texel_x * spread, texel_y * spread]),
+                            Uniform::new("u_blur_dir", [1.0, 0.0]),
+                        ],
+                    )?;
+                    let _ = frame.finish()?;
+                }
 
-            {
-                let src_tex = self.blur_tex_a.as_ref().unwrap();
-                let dst_tex = self.blur_tex_b.as_mut().unwrap();
-                let mut target = renderer.bind(dst_tex)?;
-                let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
-                frame.render_texture_from_to(
-                    src_tex,
-                    src_rect_buf,
-                    full_damage,
-                    &[full_damage],
-                    &[],
-                    Transform::Normal,
-                    1.0,
-                    Some(&self.blur_program),
-                    &[
-                        Uniform::new("u_texel_size", [texel_x * spread, texel_y * spread]),
-                        Uniform::new("u_blur_dir", [0.0, 1.0]),
-                    ],
-                )?;
-                let _ = frame.finish()?;
+                {
+                    let src_tex = self.blur_tex_a.as_ref().unwrap();
+                    let dst_tex = self.blur_tex_b.as_mut().unwrap();
+                    let mut target = renderer.bind(dst_tex)?;
+                    let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
+                    frame.render_texture_from_to(
+                        src_tex,
+                        src_rect_buf,
+                        full_damage,
+                        &[full_damage],
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        Some(&self.blur_program),
+                        &[
+                            Uniform::new("u_texel_size", [texel_x * spread, texel_y * spread]),
+                            Uniform::new("u_blur_dir", [0.0, 1.0]),
+                        ],
+                    )?;
+                    let _ = frame.finish()?;
+                }
             }
         }
 
@@ -356,8 +367,15 @@ impl GlassPipeline {
 
         // 4. Pass 3: Bangun elemen Liquid Glass di belakang Menu Bar & Dock
         let ctx_id = renderer.context_id();
-        let blur_tex = self.blur_tex_b.as_ref().unwrap().clone();
+        let glass_backdrop = if reduce_transparency {
+            self.backdrop_tex.as_ref().unwrap()
+        } else {
+            self.blur_tex_b.as_ref().unwrap()
+        };
+        let blur_tex = glass_backdrop.clone();
         let mut glass_elems: Vec<ScaraRenderElements> = Vec::with_capacity(glass_panels.len());
+        let (panel_refraction, panel_tint) =
+            glass_effect_parameters(reduce_transparency, refraction);
 
         for (rect, radius) in glass_panels {
             let uv_x = (rect.loc.x as f32) / (size.w.max(1) as f32);
@@ -389,8 +407,8 @@ impl GlassPipeline {
                     Uniform::new("u_resolution", [rect.size.w as f32, rect.size.h as f32]),
                     Uniform::new("u_panel_uv", [uv_x, uv_y, uv_w, uv_h]),
                     Uniform::new("u_radius", radius),
-                    Uniform::new("u_refraction", refraction),
-                    Uniform::new("u_tint", [0.16, 0.19, 0.30, 0.14]),
+                    Uniform::new("u_refraction", panel_refraction),
+                    Uniform::new("u_tint", panel_tint),
                 ],
             );
 
@@ -432,6 +450,7 @@ impl GlassPipeline {
                 );
             }
         }
+
         final_elems.extend(overlay_elems);
         final_elems.extend(top_elems);
         final_elems.extend(glass_elems);
@@ -446,5 +465,24 @@ impl GlassPipeline {
         )?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glass_effect_parameters;
+
+    #[test]
+    fn reduced_transparency_uses_opaque_non_refractive_glass() {
+        let (refraction, tint) = glass_effect_parameters(true, 0.02);
+        assert_eq!(refraction, 0.0);
+        assert_eq!(tint[3], 1.0);
+    }
+
+    #[test]
+    fn normal_glass_keeps_configured_refraction_and_translucent_tint() {
+        let (refraction, tint) = glass_effect_parameters(false, 0.02);
+        assert_eq!(refraction, 0.02);
+        assert_eq!(tint[3], 0.14);
     }
 }

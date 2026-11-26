@@ -173,12 +173,21 @@ impl Smallvil {
         } else if action == "config:reload" {
             if let Ok(new_cfg) = lua_bridge::load_user_config(&self.config_path) {
                 let mut cur = self.config.lock().unwrap();
-                *cur = new_cfg.lock().unwrap().clone();
+                let reduce_transparency = cur.reduce_transparency;
+                let mut reloaded = new_cfg.lock().unwrap().clone();
+                reloaded.reduce_transparency = reduce_transparency;
+                *cur = reloaded;
                 drop(cur);
                 info!("Reloaded init.lua live!");
                 if self.config.lock().unwrap().default_layout == "tiling" {
                     self.apply_tiling_layout();
                 }
+            }
+        } else if let Some(value) = action.strip_prefix("appearance:reduce-transparency:") {
+            match value {
+                "on" => self.config.lock().unwrap().reduce_transparency = true,
+                "off" => self.config.lock().unwrap().reduce_transparency = false,
+                _ => warn!(value, "Ignoring invalid reduce-transparency setting"),
             }
         } else if action == "layout:toggle" {
             let new_layout = {

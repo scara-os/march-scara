@@ -20,6 +20,8 @@ depends=(
   'pipewire-audio'
   'pipewire-pulse'
   'wireplumber'
+  'upower'
+  'power-profiles-daemon'
   'lua54'
   'kitty'
   'thunar'
@@ -49,6 +51,7 @@ depends=(
   'polkit-gnome'
   'xdg-desktop-portal'
   'xdg-desktop-portal-gtk'
+  'xdg-desktop-portal-wlr'
 )
 
 makedepends=(
@@ -64,6 +67,11 @@ optdepends=(
   'mactahoe-gtk-theme: macOS Tahoe dark theme'
   'thunar-archive-plugin: archive integration in Thunar'
   'gvfs-mtp: MTP device support in Thunar'
+  'seahorse: GNOME credentials and keyring manager'
+  'gnome-keyring: Secret Service credential storage'
+  'cups: CUPS print service and lpstat client'
+  'system-config-printer: printer and queue settings utility'
+  'gnome-software: graphical software update center'
 )
 
 provides=('march-scara')

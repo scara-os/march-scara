@@ -15,7 +15,9 @@ fn main() {
 
     match UnixStream::connect(&sock_path) {
         Ok(mut stream) => {
-            stream.write_all(cmd.as_bytes()).expect("Gagal kirim perintah");
+            stream
+                .write_all(cmd.as_bytes())
+                .expect("Gagal kirim perintah");
             stream.shutdown(std::net::Shutdown::Write).ok();
 
             let mut reply = String::new();

@@ -6,6 +6,7 @@ pub struct ScaraConfig {
     pub rounding: f32,
     pub glass_refraction: f32,
     pub blur_passes: u32,
+    pub reduce_transparency: bool,
     pub default_layout: String, // "tiling", "floating", "hybrid"
     pub keybinds: Vec<(String, String)>,
 }
@@ -16,6 +17,7 @@ impl Default for ScaraConfig {
             rounding: 18.0,
             glass_refraction: 0.015,
             blur_passes: 4,
+            reduce_transparency: false,
             default_layout: "hybrid".into(),
             keybinds: vec![],
         }
