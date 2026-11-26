@@ -26,7 +26,7 @@ depends=(
   'kitty'
   'thunar'
   'gvfs'
-  'firefox'
+  #'firefox'
   'mpv'
   'loupe'
   'gnome-calendar'
